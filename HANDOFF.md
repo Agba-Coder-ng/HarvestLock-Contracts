@@ -32,6 +32,15 @@ silently reconciling it.
   `cargo add`, not hand-picked) by dependabot in PR #5, 14 Oct 2026, with
   both CI jobs green. Don't downgrade without a reason; don't upgrade
   without checking the changelog against this contract's API usage first.
+  **Version check done, 16 Oct 2026 (issue #67):** latest is `29.0.1`
+  (12 Oct 2026). v29.0.0 (7 Oct) is the soroban-env `29.0.0` / Protocol 29
+  host bump — its release notes name no SDK API changes, and none of the
+  surface this contract uses (the `contract*` macros, `token`, `Address`,
+  `BytesN`, `Vec`, instance storage, testutils) is touched — and `29.0.1`
+  exists only to fix a wasmi runtime error `29.0.0` shipped with. Verdict:
+  **the bump is safe but not urgent**; leave it to dependabot as its own
+  CI-verified PR rather than bundling it into an unrelated change, and
+  don't bump mid-season without a reason to.
 - `stellar-cli` **v28.0.0 — installed and confirmed working.** Not via
   `cargo install` — that path is broken on this machine: the default Rust
   host toolchain here is `stable-x86_64-pc-windows-gnu`, and compiling
@@ -122,7 +131,7 @@ last session: `initialize` (now also takes `remainder_window_secs` and
 `reclaim_advance_1`/`_2`, `mark_checkpoint`, `settle`, `get_status`,
 `get_commitment`.
 
-Tests (`src/test.rs`, **134 tests, all passing** — see the "Last updated"
+Tests (`src/test.rs`, **138 tests, all passing** — see the "Last updated"
 entry for the count's history) cover, beyond last session's set: `lock` escrows
 only the deposit, not the full total; `ready_for_delivery` opens the window
 and is cooperative-gated; `fund_remainder` transfers exactly the remainder,
@@ -804,7 +813,48 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 16 Oct 2026 (later same day) — docs-only session, no contract
+*Last updated: 16 Oct 2026 (evening) — bundled issue-response session
+(#64–#67), one contract-behavior change plus three written deliverables.
+**#65**: `grade_price_bps` (`initialize`) and `set_allocation`'s member
+list were the contract's only two unbounded `Vec` inputs — neither the
+contract nor the `api/` layer capped them. Both now rejected over-cap at
+call time: `MAX_GRADE_ENTRIES = 16` (the PRD's grading examples are 3
+tiers; 16 is headroom, not a researched maximum) and
+`MAX_ALLOCATION_MEMBERS = 200` (anchored to PRD §16.3's 200-farmer
+cooperative scale), via new terminal error variants
+`GradeScheduleTooLong = 37` and `AllocationTooLarge = 38` appended to the
+enum and the discriminant snapshot. 4 new boundary tests (at-cap
+accepted, over-cap rejected, both lists), 138/138 total. **#66**:
+`docs/authorization-matrix.md` — every `require_auth()` site in `lib.rs`
+mapped function-by-function against the PRD (all 29 public functions: 13
+single-party gates, 7 permissionless, 3 multi-party, 1 flagger-checked,
+5 no-auth views), with the two deliberate divergences named so neither
+gets "corrected" back: `reassign_buyer`'s third signer (beyond §4.8's
+"cooperative consent") and the member-list "joint amendment" clause
+having no on-chain path. **#64**: `docs/ts-bindings-comparison.md` —
+regenerated `stellar contract bindings typescript` output from this
+repo's own WASM and byte-compared it against the `api/` app's hand-built
+ScVal encoders: all 13 `initialize` args plus the `set_allocation`
+members vector come out **byte-identical**, both documented encoder
+pitfalls (u32 inference, manual map key ordering) are structurally
+eliminated by the spec-driven path, recommendation is to adopt it
+app-side as a follow-up there. **#67**: soroban-sdk version check
+documented in the toolchain section above — 28.0.0 pinned vs 29.0.1
+latest, no API-affecting changes across the gap, bump deliberately left
+to dependabot.
+Also worth recording because it shaped this PR: the
+`contracts/escrow/test_snapshots/test/*.json` files are **record-only**
+in this repo's setup — the test harness writes them but never compares
+or gates on them (checked the hard way: hand-editing a snapshot's
+`share_bps` value and re-running still passes; CI runs plain
+`cargo test`). The random-`BytesN` allocation tests re-record different
+hash bytes on every local run. That's why the four new tests'
+snapshots were deliberately **not committed**: the 200-member one alone
+is ~8,700 lines of JSON with nothing load-bearing in it, and this repo's
+auto-merge bot holds PRs adding more than 1,000 lines for manual review
+(MFrancis's test-only PR #158 has sat open for exactly that reason).
+
+Prior entry: 16 Oct 2026 (later same day) — docs-only session, no contract
 code touched. Consolidated the two dev-environment gotchas into
 `docs/dev-setup-troubleshooting.md` (Windows `cargo install stellar-cli`
 failing on a missing `dlltool.exe`, and the two native dev libraries a fresh

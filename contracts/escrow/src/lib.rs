@@ -191,8 +191,9 @@ pub enum Error {
     /// never what a caller actually wants (that's what leaving
     /// `oracle_config` as `None` is for).
     InvalidOracleConfig = 24,
-    /// `oracle_rate` called but `initialize` never set an `oracle_config`
-    /// for this commitment.
+    /// `oracle_rate` or `resolve_fx_shortfall` called but `initialize`
+    /// never set an `oracle_config` for this commitment — the only two
+    /// functions that read the oracle at all (#124).
     OracleNotConfigured = 25,
     /// The configured Reflector oracle returned `None` for
     /// `oracle_config.price_asset` — it doesn't quote that asset at all
@@ -391,6 +392,16 @@ pub struct Commitment {
     /// in seconds. Same window for both tranches — PRD doesn't call for
     /// different windows per tranche, so one shared value is the simpler
     /// choice until a reason to split them shows up.
+    ///
+    /// Boundary convention (#111, pinned by `tests/deadline_boundary.rs`):
+    /// the deadline is `release time + claim_window_secs`, and *claiming* is
+    /// allowed up to **and including** that instant (`timestamp > deadline`
+    /// is the rejection guard) while *reclaiming* is allowed only **strictly
+    /// after** it (`timestamp <= deadline` is the rejection guard). The two
+    /// guards are exact complements, so every ledger timestamp belongs to
+    /// exactly one party. Consequence worth knowing: the cooperative's
+    /// effective window spans `claim_window_secs + 1` distinct timestamps
+    /// (the opening one and the deadline one), not `claim_window_secs`.
     pub claim_window_secs: u64,
     /// How long the buyer has to fund the remainder once
     /// `ready_for_delivery` opens the window. Independent of
@@ -793,12 +804,23 @@ impl EscrowContract {
 
     /// Cooperative claims tranche 1, if within the window. Requires
     /// cooperative auth.
+    ///
+    /// Boundary (#111): "within" is inclusive of the deadline instant —
+    /// `claim_tranche` rejects only when `timestamp > advance1_deadline`, so
+    /// `advance1_deadline` itself is still claimable, and it is the last
+    /// instant that is. Pinned by `tests/deadline_boundary.rs`.
     pub fn claim_advance_1(env: Env) -> Result<(), Error> {
         Self::claim_tranche(&env, Tranche::One)
     }
 
     /// Buyer reclaims tranche 1, if the window has passed unclaimed.
     /// Requires buyer auth.
+    ///
+    /// Boundary (#111): the exact complement of `claim_advance_1` —
+    /// `reclaim_tranche` rejects while `timestamp <= advance1_deadline`, so
+    /// the deadline instant belongs to the cooperative's claim and the buyer's
+    /// reclaim first becomes possible at `advance1_deadline + 1`. No timestamp
+    /// ever admits both, and none admits neither.
     pub fn reclaim_advance_1(env: Env) -> Result<(), Error> {
         Self::reclaim_tranche(&env, Tranche::One)
     }
@@ -833,13 +855,15 @@ impl EscrowContract {
     }
 
     /// Cooperative claims tranche 2, if within the window. Requires
-    /// cooperative auth — same mechanics as `claim_advance_1`.
+    /// cooperative auth — same mechanics as `claim_advance_1`, including its
+    /// inclusive `advance2_deadline` boundary (#111).
     pub fn claim_advance_2(env: Env) -> Result<(), Error> {
         Self::claim_tranche(&env, Tranche::Two)
     }
 
     /// Buyer reclaims tranche 2, if the window has passed unclaimed.
-    /// Requires buyer auth — same mechanics as `reclaim_advance_1`.
+    /// Requires buyer auth — same mechanics as `reclaim_advance_1`, including
+    /// the exclusive `advance2_deadline` boundary (#111).
     pub fn reclaim_advance_2(env: Env) -> Result<(), Error> {
         Self::reclaim_tranche(&env, Tranche::Two)
     }

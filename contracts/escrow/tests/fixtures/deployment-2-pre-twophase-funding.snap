@@ -1,0 +1,58 @@
+# #125 snapshot. Replays the call sequence HANDOFF.md records for Deployment 2
+# (the 2026-09-01 testnet run) against the current build. The two steps whose
+# recorded outcome the current build does not reproduce carry `known_divergence`
+# annotations: the replay asserts both halves (recorded != current, current ==
+# annotation), so this fixture is green *and* keeps the finding on the record.
+snapshot = deployment-2-pre-twophase-funding
+provenance = derived from HANDOFF.md "Verified on testnet", Deployment 2, contract
+   CDVF6UVJOLF3OHCFSYSJ72RMG2T6DUQ42VRJ6IHL6MVEFDYEBZ3KTFK4: 1,000,000,000 stroops
+   of native XLM, 15%/20% advance split, a deliberately short 20-second
+   claim_window_secs, and a reclaim_advance_2 of exactly 200,000,000 read back off
+   the ledger. Not chain bytes: no transaction XDR was ever captured for any of
+   the ten deployments, and HANDOFF.md declares the instances validation
+   artifacts, not infrastructure.
+note = DOCUMENTED DIVERGENCE (the finding): this transcript ran on the pre-two-phase-funding WASM (13,472 bytes, 13 exports), where `lock` escrowed the whole total_amount and `confirm_delivery` was reachable from Advance2Released. The current build escrows only the 350,000,000 deposit at `lock`, gates delivery confirmation behind ReadyForDelivery + a funded remainder, and gates `settle` behind Delivered — so an out-of-order `settle` now reports InvalidState (status gate first) where the chain reported Error(Contract, #12) TrancheUnresolved. Clients that branch on the recorded error code will see a different one.
+total_amount = 1000000000
+advance1_bps = 1500
+advance2_bps = 2000
+claim_window_secs = 20
+remainder_window_secs = 604800
+delivery_window_secs = 1036800
+contracted_quantity = 1000
+grade_price_bps = 10000,9000,7500
+buyer_mint = 1000000000
+
+step = lock => ok
+# recorded: 1,000,000,000 buyer -> contract on the old WASM. Today `lock` moves
+# the 350,000,000 deposit only; these two balances are today's, and they are why
+# the recorded settle ending below is unreachable rather than merely different.
+check = buyer_balance 650000000
+check = contract_balance 350000000
+step = release_advance_1 => ok
+step = claim_advance_1 => ok
+# recorded: 150,000,000 to the cooperative, inside the 20-second window. Still exact.
+check = coop_balance 150000000
+step = mark_checkpoint => ok
+step = release_advance_2 => ok
+# recorded live: the immediate settle attempt was rejected on-chain with
+# Error(Contract, #12) = TrancheUnresolved.
+known_divergence = settle => err(InvalidState)
+step = settle => err(TrancheUnresolved)
+# recorded live: confirm_delivery succeeded here, before any ReadyForDelivery.
+known_divergence = confirm_delivery 1000 0 => err(InvalidState)
+step = confirm_delivery 1000 0 => ok
+step = advance 21
+step = reclaim_advance_2 => ok
+# recorded: 200,000,000 back to the buyer after the 20-second window. Still exact.
+check = advance2_expired true
+check = buyer_balance 850000000
+# recorded: `settle` then swept the remaining 650,000,000 and the instance
+# finished Settled (coop 800,000,000 / buyer 200,000,000). The current build
+# cannot reach that from this transcript: without a funded remainder and a
+# confirmed delivery it refuses to settle at all.
+known_divergence = settle => err(InvalidState)
+step = settle => ok
+# today's live-verified state at the end of the same transcript.
+check = status Advance2Released
+check = coop_balance 150000000
+check = contract_balance 0

@@ -41,6 +41,120 @@ jobs:
         working-directory: contracts/escrow
         run: cargo test --verbose
 
+  # ---------------------------------------------------------------------
+  # #111, #122, #124, #125 — four integration suites, each its own job so
+  # a failure points at the issue it guards instead of at "cargo test".
+  # They are separate `--test` targets under contracts/escrow/tests/, so
+  # the umbrella `test` job above also runs them; these jobs exist so the
+  # signal is legible per issue and so a suite can be re-run alone.
+  # ---------------------------------------------------------------------
+
+  deadline-boundary:
+    name: "#111 deadline boundary tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Exact-boundary coverage for advance1_deadline/advance2_deadline against
+      # claim (inclusive at the deadline) and reclaim (exclusive).
+      - name: cargo test --test deadline_boundary
+        working-directory: contracts/escrow
+        run: cargo test --test deadline_boundary --verbose
+
+  address-equality:
+    name: "#122 Address equality audit"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Every Address-vs-Address comparison in the contract compared by value,
+      # plus a source-level guard against stringified identity comparisons.
+      - name: cargo test --test address_equality
+        working-directory: contracts/escrow
+        run: cargo test --test address_equality --verbose
+
+  oracle-fault-injection:
+    name: "#124 Reflector oracle fault injection"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Unreachable / panicking / garbage-returning / stale oracle against the
+      # documented OracleNotConfigured / OraclePriceUnavailable / OracleStale
+      # degradation paths.
+      - name: cargo test --test oracle_fault_injection
+        working-directory: contracts/escrow
+        run: cargo test --test oracle_fault_injection --verbose
+
+  snapshot-replay:
+    name: "#125 deployment snapshot replay"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Replays the transcripts under contracts/escrow/tests/fixtures/ against
+      # the current build. Green plus a printed divergence report; an
+      # undeclared divergence fails. See fixtures/README.md.
+      - name: cargo test --test snapshot_replay
+        working-directory: contracts/escrow
+        run: cargo test --test snapshot_replay -- --nocapture
+
   build-wasm:
     name: stellar contract build
     runs-on: ubuntu-latest

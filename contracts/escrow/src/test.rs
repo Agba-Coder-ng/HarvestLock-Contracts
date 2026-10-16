@@ -3105,3 +3105,216 @@ fn initialize_is_not_a_transition_and_publishes_nothing() {
     let s = setup(1_500, 1_500);
     assert_no_transition(&s);
 }
+
+// ---------- composition: feature pairs that fall between happy paths ----------
+//
+// The tests below each combine two independently well-tested
+// features into one scenario, targeting the class of bug that lives in
+// the seam between them rather than inside either one.
+
+#[test]
+fn dispute_exit_never_requires_an_oracle_read_so_a_stale_quote_cannot_deadlock_it() {
+    // Issue #107. `oracle_rate` enforces a staleness bound and
+    // `flag_dispute` freezes the commitment — two features with their own
+    // happy-path coverage. The interaction to prove: a dispute flagged
+    // while the oracle quote is going stale must not be able to trap the
+    // commitment, which would happen if dispute *exit* depended on an
+    // oracle read that's now permanently stale with no way to refresh it
+    // before another deadline forces a resolution.
+    //
+    // It can't, by construction: neither `resolve_dispute` nor
+    // `expire_dispute_window` reads the oracle at all — each only
+    // restores `dispute_pre_status`. This proves that rather than
+    // assuming it.
+    let (s, oracle) = setup_with_oracle(3_600);
+    s.contract.lock();
+    s.contract.flag_dispute(&s.buyer);
+
+    // Let the configured staleness bound lapse while the dispute is open.
+    advance_time(&s, 3_601);
+
+    // The oracle read is still *available* (never status-blocked) — it
+    // simply reports staleness, which is correct permissionless-read
+    // behavior, not a deadlock.
+    assert_eq!(s.contract.try_oracle_rate(), Err(Ok(Error::OracleStale)));
+
+    // Unanimous resolution succeeds *despite* the stale quote, because it
+    // needs no oracle read at all.
+    s.contract.resolve_dispute();
+    assert_eq!(s.contract.get_status(), Status::Locked);
+
+    // The stale window was never a permanent block on anything: refresh
+    // the oracle and the read is accepted again, and the deal resumes.
+    oracle.set_price(&176_000_000_000_000i128, &s.env.ledger().timestamp());
+    assert_eq!(s.contract.oracle_rate().price, 176_000_000_000_000);
+    s.contract.release_advance_1();
+    assert_eq!(s.contract.get_status(), Status::Advance1Released);
+}
+
+#[test]
+fn permissionless_dispute_escape_also_works_while_the_oracle_is_stale() {
+    // The other exit path — `expire_dispute_window`, permissionless once
+    // the dispute deadline passes — likewise touches no oracle, so a
+    // stale quote can't block it either. Covers the "one party refuses to
+    // ever consent" branch the unanimous `resolve_dispute` path doesn't:
+    // even with no cooperation and a permanently stale oracle, the freeze
+    // is still escapable, so it can never become permanent.
+    let (s, _oracle) = setup_with_oracle(3_600);
+    s.contract.lock();
+    s.contract.flag_dispute(&s.buyer);
+
+    // Push past both the staleness bound and the dispute deadline
+    // (`flag_dispute` set the latter to remainder_window_secs out).
+    advance_time(&s, REMAINDER_WINDOW + 1);
+    assert_eq!(s.contract.try_oracle_rate(), Err(Ok(Error::OracleStale)));
+
+    s.contract.expire_dispute_window();
+    assert_eq!(s.contract.get_status(), Status::Locked);
+}
+
+#[test]
+fn set_allocation_is_rejected_during_a_dispute_and_the_two_never_coexist() {
+    // Issue #108. `set_allocation` is documented Draft-only, and
+    // `flag_dispute` is reachable from Locked through Delivered — never
+    // from Draft — so "a dispute is open" already implies the commitment
+    // has left Draft. The interaction is unreachable-by-construction as a
+    // *success*, and must reject with `InvalidState` (the Draft gate)
+    // rather than any allocation-specific error. Proves that instead of
+    // leaving it an assumption.
+    let s = setup(1_500, 1_500);
+    let members = Vec::from_array(&s.env, [member(&s.env, 10_000)]);
+
+    // No state is ever simultaneously Draft (where set_allocation is
+    // legal) and Disputed, because a dispute can't be flagged from Draft.
+    assert_eq!(
+        s.contract.try_flag_dispute(&s.buyer),
+        Err(Ok(Error::InvalidState))
+    );
+
+    // Reach a genuinely Disputed status...
+    s.contract.lock();
+    s.contract.flag_dispute(&s.buyer);
+    assert_eq!(s.contract.get_status(), Status::Disputed);
+
+    // ...where set_allocation is rejected purely on the Draft gate —
+    // never `AllocationAlreadySet` (nothing was ever recorded) and never
+    // success.
+    assert_eq!(
+        s.contract.try_set_allocation(&members),
+        Err(Ok(Error::InvalidState))
+    );
+
+    // Still rejected after resolving: the status is now Locked, also not
+    // Draft, confirming set_allocation and an ever-opened dispute can
+    // never line up.
+    s.contract.resolve_dispute();
+    assert_eq!(
+        s.contract.try_set_allocation(&members),
+        Err(Ok(Error::InvalidState))
+    );
+}
+
+#[test]
+fn mark_checkpoint_and_confirm_delivery_are_both_frozen_by_an_open_dispute() {
+    // Issue #109. The delivery-pipeline pair — `mark_checkpoint` (needs
+    // Advance1Released) and `confirm_delivery` (needs ReadyForDelivery) —
+    // each has a required status that is a legal `flag_dispute` source,
+    // so a dispute can be opened from exactly the state each would
+    // otherwise advance from. This proves that specific pair is blocked
+    // with an explicit test rather than leaning on the general "no call
+    // accepts Disputed" pattern by inspection, and that the freeze lifts
+    // cleanly once resolved.
+
+    // -- mark_checkpoint half --
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.release_advance_1();
+    assert_eq!(s.contract.get_status(), Status::Advance1Released); // legal here
+    s.contract.flag_dispute(&s.cooperative);
+    assert_eq!(
+        s.contract.try_mark_checkpoint(),
+        Err(Ok(Error::InvalidState))
+    );
+    // Resolve back to Advance1Released, then the real call succeeds — a
+    // genuine subsequent call proves the freeze lifted, not just the
+    // status field flipping.
+    s.contract.resolve_dispute();
+    s.contract.mark_checkpoint();
+    assert_eq!(s.contract.get_status(), Status::CheckpointPassed);
+
+    // -- confirm_delivery half --
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    advance_to_remainder_funded(&s);
+    assert_eq!(s.contract.get_status(), Status::ReadyForDelivery); // legal here
+    s.contract.flag_dispute(&s.warehouse);
+    assert_eq!(
+        s.contract
+            .try_confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE),
+        Err(Ok(Error::InvalidState))
+    );
+    s.contract.resolve_dispute();
+    s.contract
+        .confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
+    assert_eq!(s.contract.get_status(), Status::Delivered);
+}
+
+#[test]
+fn expire_fx_shortfall_window_and_a_same_ledger_dispute_stay_consistent_in_either_order() {
+    // Issue #110. `expire_fx_shortfall_window` is permissionless and a
+    // dispute can be flagged from Delivered — both could plausibly be
+    // submitted against the same Delivered commitment in the same ledger
+    // close. Soroban orders transactions within a ledger into one total
+    // order, so exactly one runs first; the property to prove is that the
+    // contract ends consistent whichever does, with the escrow swept
+    // exactly once — never twice, never zero times leaving an unfunded
+    // shortfall frozen indefinitely.
+
+    // Order A: expire_fx_shortfall_window lands first.
+    let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s);
+    s.contract.resolve_fx_shortfall();
+    advance_time(&s, REMAINDER_WINDOW + 1); // fx_shortfall_deadline passes
+    let coop_before = s.token.balance(&s.cooperative);
+    let contract_held = s.token.balance(&s.contract.address);
+
+    s.contract.expire_fx_shortfall_window(); // Delivered -> Defaulted, sweep
+
+    assert_eq!(s.contract.get_status(), Status::Defaulted);
+    // The dispute flag that "lost the race" is now cleanly rejected:
+    // Defaulted is terminal and never a flag_dispute source.
+    assert_eq!(
+        s.contract.try_flag_dispute(&s.buyer),
+        Err(Ok(Error::InvalidState))
+    );
+    // Swept exactly once.
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(s.token.balance(&s.cooperative), coop_before + contract_held);
+
+    // Order B: flag_dispute lands first.
+    let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s);
+    s.contract.resolve_fx_shortfall();
+    advance_time(&s, REMAINDER_WINDOW + 1);
+    s.contract.flag_dispute(&s.cooperative); // Delivered -> Disputed(pre=Delivered)
+
+    assert_eq!(s.contract.get_status(), Status::Disputed);
+    // expire_fx_shortfall_window now sees a non-Delivered status and
+    // refuses — no sweep, no default, while the freeze holds.
+    assert_eq!(
+        s.contract.try_expire_fx_shortfall_window(),
+        Err(Ok(Error::InvalidState))
+    );
+    assert!(s.token.balance(&s.contract.address) > 0); // escrow untouched
+
+    // Resolving restores Delivered exactly, at which point the sweep runs
+    // and produces the identical terminal outcome as Order A.
+    s.contract.resolve_dispute();
+    assert_eq!(s.contract.get_status(), Status::Delivered);
+    let coop_before = s.token.balance(&s.cooperative);
+    let contract_held = s.token.balance(&s.contract.address);
+    s.contract.expire_fx_shortfall_window();
+    assert_eq!(s.contract.get_status(), Status::Defaulted);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(s.token.balance(&s.cooperative), coop_before + contract_held);
+}

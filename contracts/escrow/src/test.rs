@@ -423,6 +423,35 @@ fn allocation_shares_summing_to_under_10000_bps_is_allowed() {
 }
 
 #[test]
+fn cannot_set_allocation_with_more_than_max_members() {
+    // The member-count cap is anchored to the PRD §16.3 scale (200
+    // members). The share-sum check alone can't catch an oversized list
+    // -- any long list can still sum to under 10_000 bps -- so the
+    // length itself has to be rejected.
+    let s = setup(1_500, 1_500);
+    let mut members = Vec::new(&s.env);
+    for _ in 0..(MAX_ALLOCATION_MEMBERS + 1) {
+        members.push_back(member(&s.env, 1));
+    }
+    let result = s.contract.try_set_allocation(&members);
+    assert_eq!(result, Err(Ok(Error::AllocationTooLarge)));
+}
+
+#[test]
+fn allocation_with_exactly_max_members_is_allowed() {
+    // Boundary: `MAX_ALLOCATION_MEMBERS` members at 50 bps each sums to
+    // exactly 10_000 -- at both the member cap and the share-sum
+    // ceiling, and still valid.
+    let s = setup(1_500, 1_500);
+    let mut members = Vec::new(&s.env);
+    for _ in 0..MAX_ALLOCATION_MEMBERS {
+        members.push_back(member(&s.env, 50));
+    }
+    s.contract.set_allocation(&members);
+    assert_eq!(s.contract.get_allocation().len(), MAX_ALLOCATION_MEMBERS);
+}
+
+#[test]
 fn cannot_set_allocation_after_lock() {
     let s = setup(1_500, 1_500);
     s.contract.lock();
@@ -1695,6 +1724,82 @@ fn initialize_rejects_a_grade_priced_over_10000_bps() {
         &None,
     );
     assert_eq!(result, Err(Ok(Error::InvalidGradeSchedule)));
+}
+
+#[test]
+fn initialize_rejects_a_grade_schedule_over_max_entries() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let buyer = Address::generate(&env);
+    let cooperative = Address::generate(&env);
+    let warehouse = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, _token, _admin) = create_token(&env, &token_admin);
+
+    let contract_id = env.register(EscrowContract, ());
+    let contract = EscrowContractClient::new(&env, &contract_id);
+
+    let mut over_cap = Vec::new(&env);
+    for _ in 0..(MAX_GRADE_ENTRIES + 1) {
+        over_cap.push_back(10_000u32);
+    }
+
+    let result = contract.try_initialize(
+        &buyer,
+        &cooperative,
+        &warehouse,
+        &token_address,
+        &1_000_000,
+        &1_000,
+        &1_000,
+        &WINDOW,
+        &REMAINDER_WINDOW,
+        &DELIVERY_WINDOW,
+        &CONTRACTED_QUANTITY,
+        &over_cap,
+        &None,
+    );
+    assert_eq!(result, Err(Ok(Error::GradeScheduleTooLong)));
+}
+
+#[test]
+fn initialize_accepts_a_grade_schedule_at_max_entries() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let buyer = Address::generate(&env);
+    let cooperative = Address::generate(&env);
+    let warehouse = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, _token, _admin) = create_token(&env, &token_admin);
+
+    let contract_id = env.register(EscrowContract, ());
+    let contract = EscrowContractClient::new(&env, &contract_id);
+
+    let mut at_cap = Vec::new(&env);
+    for _ in 0..MAX_GRADE_ENTRIES {
+        at_cap.push_back(10_000u32);
+    }
+
+    contract.initialize(
+        &buyer,
+        &cooperative,
+        &warehouse,
+        &token_address,
+        &1_000_000,
+        &1_000,
+        &1_000,
+        &WINDOW,
+        &REMAINDER_WINDOW,
+        &DELIVERY_WINDOW,
+        &CONTRACTED_QUANTITY,
+        &at_cap,
+        &None,
+    );
+    assert_eq!(contract.get_status(), Status::Draft);
+    assert_eq!(
+        contract.get_commitment().grade_price_bps.len(),
+        MAX_GRADE_ENTRIES
+    );
 }
 
 #[test]

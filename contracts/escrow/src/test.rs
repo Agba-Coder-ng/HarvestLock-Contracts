@@ -1392,6 +1392,52 @@ fn expire_remainder_window_is_permissionless() {
     assert_eq!(s.contract.get_status(), Status::Defaulted);
 }
 
+#[test]
+fn expire_remainder_window_works_when_only_a_third_party_signs() {
+    // Issue #73: "called by a genuinely unrelated third-party address
+    // (confirm it's still permissionless, not accidentally gated)". The
+    // test above runs under mock_all_auths(), which satisfies any
+    // require_auth() a future accidental gate would add — it cannot tell
+    // "permissionless" from "every party's auth silently provided".
+    // mock_auths(&[stranger]) can: every require_auth() except the
+    // stranger's own exact invocation would fail, so this call succeeding
+    // proves the path requires no signature at all — the stranger's entry
+    // is never even consumed. The tranches are deliberately left
+    // unclaimed, so the sweep has a non-zero balance to move and the
+    // assertions cover the actual transfer, not just the status flip.
+    let s = setup(1_500, 2_000);
+    s.contract.lock();
+    s.contract.release_advance_1();
+    s.contract.mark_checkpoint();
+    s.contract.release_advance_2();
+    s.contract.ready_for_delivery();
+    advance_time(&s, REMAINDER_WINDOW + 1);
+
+    let stranger = Address::generate(&s.env);
+    let invoke = mock_invoke(
+        &s.contract.address,
+        "expire_remainder_window",
+        ().into_val(&s.env),
+    );
+    s.env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &invoke,
+    }]);
+
+    let contract_balance_before = s.token.balance(&s.contract.address);
+    let cooperative_balance_before = s.token.balance(&s.cooperative);
+    assert!(contract_balance_before > 0); // the unclaimed deposit
+
+    s.contract.expire_remainder_window();
+
+    assert_eq!(s.contract.get_status(), Status::Defaulted);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(
+        s.token.balance(&s.cooperative),
+        cooperative_balance_before + contract_balance_before
+    );
+}
+
 // ---------- reclaim_on_nondelivery (seller-non-delivery forfeiture) ----------
 
 #[test]
@@ -1482,6 +1528,59 @@ fn reclaim_on_nondelivery_requires_buyer_auth() {
     s.contract.reclaim_on_nondelivery();
     let auths = s.env.auths();
     assert!(auths.iter().any(|(addr, _)| *addr == s.buyer));
+}
+
+#[test]
+fn reclaim_on_nondelivery_attempted_by_a_non_buyer_fails() {
+    // Issue #72: the same call "attempted by someone other than the
+    // buyer". The test above runs under mock_all_auths(), which can show
+    // the buyer's require_auth() is reached, never that anyone else's
+    // signature is insufficient. Under mock_auths(&[stranger]) the
+    // stranger's entry is the only one in the authorization set, so
+    // c.buyer.require_auth() matches nothing: the call must abort as a
+    // host auth error and leave no partial state. The buyer's own entry
+    // then succeeds from that exact same state, proving the gate is
+    // precisely "the buyer's signature" — not some other condition that
+    // would also have stopped the buyer.
+    let s = setup(1_500, 2_000);
+    s.contract.lock();
+    advance_time(&s, DELIVERY_WINDOW + 1);
+
+    let stranger = Address::generate(&s.env);
+    let buyer_balance_before = s.token.balance(&s.buyer);
+    let contract_balance_before = s.token.balance(&s.contract.address);
+
+    let invoke = mock_invoke(
+        &s.contract.address,
+        "reclaim_on_nondelivery",
+        ().into_val(&s.env),
+    );
+    s.env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &invoke,
+    }]);
+    let result = s.contract.try_reclaim_on_nondelivery();
+    assert!(
+        matches!(result, Err(Err(_))),
+        "a non-buyer's signature must not reclaim: {result:?}"
+    );
+    // Atomicity: the rejected invocation rolled back every write.
+    assert_eq!(s.contract.get_status(), Status::Locked);
+    assert_eq!(
+        s.token.balance(&s.contract.address),
+        contract_balance_before
+    );
+    assert_eq!(s.token.balance(&s.buyer), buyer_balance_before);
+
+    // Same call, the one signature it actually requires.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.buyer,
+        invoke: &invoke,
+    }]);
+    s.contract.reclaim_on_nondelivery();
+    assert_eq!(s.contract.get_status(), Status::Forfeited);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(s.token.balance(&s.buyer), s.total_amount);
 }
 
 // ---------- confirm_delivery now gated on remainder funded ----------
@@ -2404,6 +2503,98 @@ fn dispute_does_not_pause_an_already_ticking_deadline_known_limitation() {
     let deposit = deposit_amount(s.total_amount, 1_500, 1_500);
     let advance1_amount = s.total_amount * 1_500 / 10_000;
     assert_eq!(s.token.balance(&s.buyer), s.total_amount - deposit + advance1_amount);
+}
+
+#[test]
+fn dispute_in_the_remainder_window_the_remainder_deadline_still_governs() {
+    // Issue #75, the `remainder_deadline` half: extends the known-limitation
+    // test above from the advance-1 claim window to `expire_remainder_window`'s
+    // own deadline. The dispute is flagged with one second left on the
+    // remainder window, so that deadline expires mid-freeze while the
+    // dispute's own (equally long) window is still open. Which deadline
+    // governs: the remainder deadline. The freeze controls who can act —
+    // status-gated calls bounce for as long as it lasts — but it never
+    // pauses, extends, or resets the deadline itself, so once the dispute
+    // resolves, curing is already impossible and the expired deadline's
+    // consequence is immediately available.
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.release_advance_1();
+    s.contract.mark_checkpoint();
+    s.contract.release_advance_2();
+    s.contract.ready_for_delivery();
+
+    advance_time(&s, REMAINDER_WINDOW - 1);
+    s.contract.flag_dispute(&s.buyer);
+    advance_time(&s, 2); // past remainder_deadline (604_800), still inside dispute_deadline (1_209_599)
+
+    // The dispute is genuinely still open — it's the other deadline that
+    // expired.
+    let result = s.contract.try_expire_dispute_window();
+    assert_eq!(result, Err(Ok(Error::DisputeWindowNotPassed)));
+
+    // While frozen, the past-due remainder deadline changes nothing: the
+    // status gate bounces the call.
+    let result = s.contract.try_expire_remainder_window();
+    assert_eq!(result, Err(Ok(Error::InvalidState)));
+
+    // The parties resolve — status restores to exactly the pre-dispute
+    // ReadyForDelivery ...
+    s.contract.resolve_dispute();
+    assert_eq!(s.contract.get_status(), Status::ReadyForDelivery);
+
+    // ... but the remainder deadline governs from here: the freeze didn't
+    // extend it, so the buyer can no longer cure by funding ...
+    let result = s.contract.try_fund_remainder();
+    assert_eq!(result, Err(Ok(Error::RemainderWindowPassed)));
+
+    // ... and the expired deadline's own consequence executes immediately.
+    let deposit = deposit_amount(s.total_amount, 1_500, 1_500);
+    s.contract.expire_remainder_window();
+    assert_eq!(s.contract.get_status(), Status::Defaulted);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(s.token.balance(&s.cooperative), deposit);
+}
+
+#[test]
+fn dispute_in_the_fx_shortfall_window_the_fx_shortfall_deadline_still_governs() {
+    // Issue #75, the `fx_shortfall_deadline` half: same shape as the
+    // remainder-window test above, on the window `resolve_fx_shortfall`
+    // opens once a genuine shortfall exists. The top-up deadline expires
+    // mid-freeze; the shortfall deadline still governs.
+    let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s);
+    s.contract.resolve_fx_shortfall();
+
+    advance_time(&s, REMAINDER_WINDOW - 1);
+    s.contract.flag_dispute(&s.buyer);
+    advance_time(&s, 2); // past fx_shortfall_deadline, still inside dispute_deadline
+
+    let result = s.contract.try_expire_dispute_window();
+    assert_eq!(result, Err(Ok(Error::DisputeWindowNotPassed)));
+
+    // While frozen, the past-due FX deadline changes nothing.
+    let result = s.contract.try_expire_fx_shortfall_window();
+    assert_eq!(result, Err(Ok(Error::InvalidState)));
+
+    s.contract.resolve_dispute();
+    assert_eq!(s.contract.get_status(), Status::Delivered);
+
+    // The deadline governs: the top-up can no longer be paid in ...
+    let result = s.contract.try_fund_fx_shortfall();
+    assert_eq!(result, Err(Ok(Error::FxShortfallWindowPassed)));
+
+    // ... and its consequence executes immediately: the escrowed remainder
+    // sweeps to the cooperative, Defaulted.
+    let escrow_before = s.token.balance(&s.contract.address); // the 700_000 funded remainder
+    let cooperative_before = s.token.balance(&s.cooperative); // the claimed 300_000
+    s.contract.expire_fx_shortfall_window();
+    assert_eq!(s.contract.get_status(), Status::Defaulted);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(
+        s.token.balance(&s.cooperative),
+        cooperative_before + escrow_before
+    );
 }
 
 // ---------- multi-party Soroban auth model scrutiny (#138-#141) ----------

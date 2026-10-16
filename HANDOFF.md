@@ -32,6 +32,15 @@ silently reconciling it.
   `cargo add`, not hand-picked) by dependabot in PR #5, 14 Oct 2026, with
   both CI jobs green. Don't downgrade without a reason; don't upgrade
   without checking the changelog against this contract's API usage first.
+  **Version check done, 16 Oct 2026 (issue #67):** latest is `29.0.1`
+  (12 Oct 2026). v29.0.0 (7 Oct) is the soroban-env `29.0.0` / Protocol 29
+  host bump — its release notes name no SDK API changes, and none of the
+  surface this contract uses (the `contract*` macros, `token`, `Address`,
+  `BytesN`, `Vec`, instance storage, testutils) is touched — and `29.0.1`
+  exists only to fix a wasmi runtime error `29.0.0` shipped with. Verdict:
+  **the bump is safe but not urgent**; leave it to dependabot as its own
+  CI-verified PR rather than bundling it into an unrelated change, and
+  don't bump mid-season without a reason to.
 - `stellar-cli` **v28.0.0 — installed and confirmed working.** Not via
   `cargo install` — that path is broken on this machine: the default Rust
   host toolchain here is `stable-x86_64-pc-windows-gnu`, and compiling
@@ -804,32 +813,46 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 16 Oct 2026 (later same day) — test-only session, no contract
-code touched. The next four "verify this is covered" issues audited — three
-were real gaps, closed with four new tests; the fourth was already covered.
-**#73**: the old "permissionless" test for `expire_remainder_window` ran
-under `mock_all_auths()`, which satisfies every `require_auth` and so can
-never disprove a gate. New test: one mocked signature, from an address that
-is no party to the deal, with every other `require_auth` failing — the call
-still lands `Defaulted` and sweeps the contract balance to the cooperative.
-**#72**: a non-buyer's signature on `reclaim_on_nondelivery` now observably
-aborts (host auth) with status still `Locked` and no balance moving; the
-buyer's own signature then succeeds and `Forfeited` lands. **#75**: a
-dispute flagged inside the remainder or FX-shortfall window does not pause
-that deadline — while the freeze is open, `expire_remainder_window` refuses
-(`InvalidState`) and the dispute window itself hasn't passed; once
-`resolve_dispute` restores the pre-dispute status, `fund_remainder`/
-`fund_fx_shortfall` refuse as
-`RemainderWindowPassed`/`FxShortfallWindowPassed`, and `expire_*` is the
-only path left — the remainder and FX counterparts of the advance-1
-deadline case already documented and tested. **#74** was already covered —
-`settle_blocked_until_fx_resolved` and
-`settle_blocked_while_fx_shortfall_unfunded` both fund the remainder first
-by construction and assert exactly that gate (remainder in, FX unresolved →
-settle blocked) — answered with a comment, no new test. All four new tests
-use explicit `mock_auths(&[...])` so rejection is observable, and each was
-mutation-checked against a deliberately broken contract. Test count is 138,
-not 134.
+*Last updated: 16 Oct 2026 (evening) — bundled issue-response session
+(#64–#67), one contract-behavior change plus three written deliverables.
+**#65**: `grade_price_bps` (`initialize`) and `set_allocation`'s member
+list were the contract's only two unbounded `Vec` inputs — neither the
+contract nor the `api/` layer capped them. Both now rejected over-cap at
+call time: `MAX_GRADE_ENTRIES = 16` (the PRD's grading examples are 3
+tiers; 16 is headroom, not a researched maximum) and
+`MAX_ALLOCATION_MEMBERS = 200` (anchored to PRD §16.3's 200-farmer
+cooperative scale), via new terminal error variants
+`GradeScheduleTooLong = 37` and `AllocationTooLarge = 38` appended to the
+enum and the discriminant snapshot. 4 new boundary tests (at-cap
+accepted, over-cap rejected, both lists), 138/138 total. **#66**:
+`docs/authorization-matrix.md` — every `require_auth()` site in `lib.rs`
+mapped function-by-function against the PRD (all 29 public functions: 13
+single-party gates, 7 permissionless, 3 multi-party, 1 flagger-checked,
+5 no-auth views), with the two deliberate divergences named so neither
+gets "corrected" back: `reassign_buyer`'s third signer (beyond §4.8's
+"cooperative consent") and the member-list "joint amendment" clause
+having no on-chain path. **#64**: `docs/ts-bindings-comparison.md` —
+regenerated `stellar contract bindings typescript` output from this
+repo's own WASM and byte-compared it against the `api/` app's hand-built
+ScVal encoders: all 13 `initialize` args plus the `set_allocation`
+members vector come out **byte-identical**, both documented encoder
+pitfalls (u32 inference, manual map key ordering) are structurally
+eliminated by the spec-driven path, recommendation is to adopt it
+app-side as a follow-up there. **#67**: soroban-sdk version check
+documented in the toolchain section above — 28.0.0 pinned vs 29.0.1
+latest, no API-affecting changes across the gap, bump deliberately left
+to dependabot.
+Also worth recording because it shaped this PR: the
+`contracts/escrow/test_snapshots/test/*.json` files are **record-only**
+in this repo's setup — the test harness writes them but never compares
+or gates on them (checked the hard way: hand-editing a snapshot's
+`share_bps` value and re-running still passes; CI runs plain
+`cargo test`). The random-`BytesN` allocation tests re-record different
+hash bytes on every local run. That's why the four new tests'
+snapshots were deliberately **not committed**: the 200-member one alone
+is ~8,700 lines of JSON with nothing load-bearing in it, and this repo's
+auto-merge bot holds PRs adding more than 1,000 lines for manual review
+(MFrancis's test-only PR #158 has sat open for exactly that reason).
 
 Prior entry: 16 Oct 2026 (later same day) — docs-only session, no contract
 code touched. Consolidated the two dev-environment gotchas into

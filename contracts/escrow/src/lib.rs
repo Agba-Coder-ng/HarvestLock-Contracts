@@ -99,6 +99,21 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec,
 };
 
+/// Maximum number of entries `initialize` accepts in `grade_price_bps`.
+/// Deliberately generous — the PRD's grading examples are 3 tiers (A/B/C),
+/// so 16 leaves headroom for any realistic refinement while keeping the
+/// schedule's per-call iteration and storage cost bounded. See the
+/// `GradeScheduleTooLong` error.
+pub const MAX_GRADE_ENTRIES: u32 = 16;
+
+/// Maximum number of members `set_allocation` accepts. Anchored to PRD
+/// §16.3, which sizes the disbursement design against a 200-farmer
+/// cooperative ("200 payments of ~$50", "across 200 members") — the
+/// largest real membership this product is specified for. A list meaningfully
+/// longer than that is a caller mistake, not a bigger cooperative. See the
+/// `AllocationTooLarge` error.
+pub const MAX_ALLOCATION_MEMBERS: u32 = 200;
+
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -220,6 +235,15 @@ pub enum Error {
     /// call, while `status` isn't `Disputed` at all (covered by the same
     /// `InvalidState` every other status-gated call already uses).
     DisputeWindowNotPassed = 36,
+    /// `initialize`'s `grade_price_bps` held more than
+    /// `MAX_GRADE_ENTRIES` entries — longer than any real grading
+    /// schedule needs, and unbounded work the contract shouldn't accept.
+    GradeScheduleTooLong = 37,
+    /// `set_allocation`'s `members` held more than
+    /// `MAX_ALLOCATION_MEMBERS` entries — beyond the PRD's specified
+    /// cooperative scale, and unbounded storage the contract shouldn't
+    /// accept.
+    AllocationTooLarge = 38,
 }
 
 #[contracttype]
@@ -473,6 +497,9 @@ impl EscrowContract {
     /// future deposit — the cooperative and warehouse operator don't need
     /// to co-sign contract creation itself, only the state transitions
     /// that matter to them (`mark_checkpoint`, `confirm_delivery`).
+    ///
+    /// `grade_price_bps` must be non-empty, may hold at most
+    /// `MAX_GRADE_ENTRIES` entries, and every entry must be ≤ 10_000.
     pub fn initialize(
         env: Env,
         buyer: Address,
@@ -508,6 +535,9 @@ impl EscrowContract {
         }
         if grade_price_bps.is_empty() || grade_price_bps.iter().any(|bps| bps > 10_000) {
             return Err(Error::InvalidGradeSchedule);
+        }
+        if grade_price_bps.len() > MAX_GRADE_ENTRIES {
+            return Err(Error::GradeScheduleTooLong);
         }
         if let Some(oc) = &oracle_config {
             if oc.max_age_secs == 0 {
@@ -621,6 +651,9 @@ impl EscrowContract {
     /// of one, rounding-remainder handling) and isn't built.
     ///
     /// One-time and immutable once set — no amend function exists.
+    /// `members` must be non-empty, may hold at most
+    /// `MAX_ALLOCATION_MEMBERS` entries, and the shares must sum to at
+    /// most 10_000 bps.
     /// Deliberately **not** required before `lock`: a solo-farmer
     /// commitment with no cooperative pooling shouldn't be forced through
     /// a ledger step that doesn't apply to it, and gating `lock` on this
@@ -643,6 +676,9 @@ impl EscrowContract {
         }
         if members.is_empty() {
             return Err(Error::InvalidAllocation);
+        }
+        if members.len() > MAX_ALLOCATION_MEMBERS {
+            return Err(Error::AllocationTooLarge);
         }
         let mut total_bps: u32 = 0;
         for m in members.iter() {

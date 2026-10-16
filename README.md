@@ -69,7 +69,7 @@ top-up on real testnet (see HANDOFF.md's Deployment 9). PRD's must-have
 let any one of the three named parties freeze a commitment and either
 unanimous consent or a timeout resume it — still not arbitration of
 who's at fault, a bounded pause only, by explicit design (see
-HANDOFF.md). 120 tests passing, deployed and exercised on Stellar
+HANDOFF.md). 138 tests passing, deployed and exercised on Stellar
 testnet ten times. Reflector's real testnet oracle doesn't quote NGN
 yet (confirmed live, not assumed — GBP proves the mechanism instead) —
 tracked in HANDOFF.md's "next steps," matching
@@ -102,6 +102,9 @@ libraries a fresh Linux runner is missing.
 ## Reference
 
 - **PRD**: [`docs/PRD.md`](https://github.com/Agrisettle/HarvestLock/blob/main/docs/PRD.md) in the `HarvestLock` repo — see §4.8 (contract design), §4.5 (why this can't hold custody keys), §16.3 (oracle staleness and depeg handling the contract must account for)
+- **Authorization model**: [`docs/authorization-matrix.md`](./docs/authorization-matrix.md) — every `require_auth()` site in the contract mapped to the PRD's model, including the two places the code is deliberately stricter than a plain PRD reading
+- **Dispute scope**: [`docs/dispute-scope.md`](./docs/dispute-scope.md) — what `flag_dispute`/`resolve_dispute` cover (a bounded pause) and deliberately don't (arbitration)
+- **TypeScript bindings**: [`docs/ts-bindings-comparison.md`](./docs/ts-bindings-comparison.md) — generated `stellar contract bindings typescript` output byte-compared against the `HarvestLock` app's hand-built ScVal encoders, with the adoption recommendation
 - **Contributing**: [`CONTRIBUTING.md`](./CONTRIBUTING.md) here is a pointer, not a separate guide — see [`HarvestLock`](https://github.com/Agrisettle/HarvestLock)'s [`CONTRIBUTING.md`](https://github.com/Agrisettle/HarvestLock/blob/main/CONTRIBUTING.md) for the real one, shared across every repo under this org
 - **Security**: [`SECURITY.md`](./SECURITY.md) — report vulnerabilities privately, especially anything in this contract
 - **Org**: [Agrisettle](https://github.com/Agrisettle) ([LinkedIn](https://www.linkedin.com/company/agrisettle))

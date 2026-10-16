@@ -122,7 +122,7 @@ last session: `initialize` (now also takes `remainder_window_secs` and
 `reclaim_advance_1`/`_2`, `mark_checkpoint`, `settle`, `get_status`,
 `get_commitment`.
 
-Tests (`src/test.rs`, **134 tests, all passing** — see the "Last updated"
+Tests (`src/test.rs`, **138 tests, all passing** — see the "Last updated"
 entry for the count's history) cover, beyond last session's set: `lock` escrows
 only the deposit, not the full total; `ready_for_delivery` opens the window
 and is cooperative-gated; `fund_remainder` transfers exactly the remainder,
@@ -804,7 +804,34 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 16 Oct 2026 (later same day) — docs-only session, no contract
+*Last updated: 16 Oct 2026 (later same day) — test-only session, no contract
+code touched. The next four "verify this is covered" issues audited — three
+were real gaps, closed with four new tests; the fourth was already covered.
+**#73**: the old "permissionless" test for `expire_remainder_window` ran
+under `mock_all_auths()`, which satisfies every `require_auth` and so can
+never disprove a gate. New test: one mocked signature, from an address that
+is no party to the deal, with every other `require_auth` failing — the call
+still lands `Defaulted` and sweeps the contract balance to the cooperative.
+**#72**: a non-buyer's signature on `reclaim_on_nondelivery` now observably
+aborts (host auth) with status still `Locked` and no balance moving; the
+buyer's own signature then succeeds and `Forfeited` lands. **#75**: a
+dispute flagged inside the remainder or FX-shortfall window does not pause
+that deadline — while the freeze is open, `expire_remainder_window` refuses
+(`InvalidState`) and the dispute window itself hasn't passed; once
+`resolve_dispute` restores the pre-dispute status, `fund_remainder`/
+`fund_fx_shortfall` refuse as
+`RemainderWindowPassed`/`FxShortfallWindowPassed`, and `expire_*` is the
+only path left — the remainder and FX counterparts of the advance-1
+deadline case already documented and tested. **#74** was already covered —
+`settle_blocked_until_fx_resolved` and
+`settle_blocked_while_fx_shortfall_unfunded` both fund the remainder first
+by construction and assert exactly that gate (remainder in, FX unresolved →
+settle blocked) — answered with a comment, no new test. All four new tests
+use explicit `mock_auths(&[...])` so rejection is observable, and each was
+mutation-checked against a deliberately broken contract. Test count is 138,
+not 134.
+
+Prior entry: 16 Oct 2026 (later same day) — docs-only session, no contract
 code touched. Consolidated the two dev-environment gotchas into
 `docs/dev-setup-troubleshooting.md` (Windows `cargo install stellar-cli`
 failing on a missing `dlltool.exe`, and the two native dev libraries a fresh

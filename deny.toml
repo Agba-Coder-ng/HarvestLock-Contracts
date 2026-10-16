@@ -1,0 +1,24 @@
+[advisories]
+# Advisory database source and version
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+vulnerability = "deny"
+unmaintained = "deny"
+yanked = "deny"
+notice = "warn"
+ignore = []
+
+[bans]
+# Ban yanked crates from the dependency tree
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+# Allow specific crates that are known to have multiple versions in the tree
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

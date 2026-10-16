@@ -158,6 +158,16 @@ fn advance_time(s: &Setup, secs: u64) {
     s.env.ledger().set_timestamp(now + secs);
 }
 
+/// Sets the simulated ledger clock to an absolute timestamp. The
+/// deadline-boundary tests below read the deadline straight out of contract
+/// state and jump to exactly that value: `advance_time`'s `now + secs`
+/// expresses "clearly before" / "clearly after" fine, but re-deriving the
+/// deadline by hand to land on it exactly is the same hand-arithmetic those
+/// tests exist to avoid (and would let a wrong window-length constant hide).
+fn set_time(s: &Setup, timestamp: u64) {
+    s.env.ledger().set_timestamp(timestamp);
+}
+
 /// The deposit-only amount `lock` actually escrows, for a given bps split —
 /// mirrors `EscrowContract::deposit_amount` so tests can assert against it
 /// without reaching into contract internals.
@@ -178,6 +188,18 @@ fn advance_to_remainder_funded(s: &Setup) {
     s.contract.claim_advance_2();
     s.contract.ready_for_delivery();
     s.contract.fund_remainder();
+}
+
+/// The same drive, stopping at `ReadyForDelivery` with the remainder
+/// deliberately left **unfunded** — the state every `remainder_deadline`
+/// boundary assertion starts from.
+fn advance_to_ready_for_delivery(s: &Setup) {
+    s.contract.release_advance_1();
+    s.contract.claim_advance_1();
+    s.contract.mark_checkpoint();
+    s.contract.release_advance_2();
+    s.contract.claim_advance_2();
+    s.contract.ready_for_delivery();
 }
 
 // ---------- basic lifecycle ----------
@@ -1006,6 +1028,45 @@ fn cannot_expire_fx_shortfall_window_before_the_deadline() {
     assert_eq!(result, Err(Ok(Error::FxShortfallWindowNotPassed)));
 }
 
+/// #114 — the exact `fx_shortfall_deadline` boundary.
+///
+/// Same shape as #112's `remainder_deadline`: `fund_fx_shortfall` rejects
+/// only `now > fx_shortfall_deadline` (the deadline second is still the
+/// buyer's window), while `expire_fx_shortfall_window` requires strictly
+/// more than the deadline.
+#[test]
+fn fx_shortfall_deadline_boundary_is_inclusive_for_funding_and_exclusive_for_expiry() {
+    // At exactly the deadline: expiry refused, funding accepted.
+    let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s);
+    s.contract.resolve_fx_shortfall();
+    let deadline = s.contract.get_commitment().fx_shortfall_deadline;
+    assert!(deadline > 0, "a real shortfall must open a deadline");
+    set_time(&s, deadline);
+
+    assert_eq!(
+        s.contract.try_expire_fx_shortfall_window(),
+        Err(Ok(Error::FxShortfallWindowNotPassed))
+    );
+    s.contract.fund_fx_shortfall();
+    assert!(s.contract.get_commitment().fx_shortfall_funded);
+
+    // One second later both halves flip: funding is refused and the very
+    // same expiry call that was refused above now succeeds.
+    let (s2, _oracle2) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s2);
+    s2.contract.resolve_fx_shortfall();
+    let deadline2 = s2.contract.get_commitment().fx_shortfall_deadline;
+    set_time(&s2, deadline2 + 1);
+
+    assert_eq!(
+        s2.contract.try_fund_fx_shortfall(),
+        Err(Ok(Error::FxShortfallWindowPassed))
+    );
+    s2.contract.expire_fx_shortfall_window();
+    assert_eq!(s2.contract.get_status(), Status::Defaulted);
+}
+
 #[test]
 fn cannot_expire_fx_shortfall_window_once_funded() {
     let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
@@ -1353,6 +1414,49 @@ fn cannot_expire_remainder_window_before_deadline() {
     assert_eq!(result, Err(Ok(Error::RemainderWindowNotPassed)));
 }
 
+/// #112 — the exact `remainder_deadline` boundary, at the deadline second
+/// itself and not one second either side of it.
+///
+/// The two guards read in opposite directions on purpose: `fund_remainder`
+/// rejects only `now > remainder_deadline` (inclusive — the deadline second
+/// is still the buyer's to pay in), while `expire_remainder_window` requires
+/// `now > remainder_deadline` (exclusive — the default path is not open in
+/// that second). A payment and a default therefore can never both be legal
+/// at the same timestamp. The clock is set to the deadline read back out of
+/// contract state, not to a value re-derived from `REMAINDER_WINDOW` by hand.
+#[test]
+fn remainder_deadline_boundary_is_inclusive_for_funding_and_exclusive_for_expiry() {
+    // At exactly the deadline: expiry refused, funding accepted.
+    let s = setup(1_500, 2_000);
+    s.contract.lock();
+    advance_to_ready_for_delivery(&s);
+    let deadline = s.contract.get_commitment().remainder_deadline;
+    set_time(&s, deadline);
+
+    assert_eq!(
+        s.contract.try_expire_remainder_window(),
+        Err(Ok(Error::RemainderWindowNotPassed))
+    );
+    s.contract.fund_remainder();
+    assert!(s.contract.get_commitment().remainder_funded);
+
+    // One second later both halves flip: funding is refused and the very
+    // same expiry call that was refused above now succeeds, so the boundary
+    // sits exactly between `deadline` and `deadline + 1`.
+    let s2 = setup(1_500, 2_000);
+    s2.contract.lock();
+    advance_to_ready_for_delivery(&s2);
+    let deadline2 = s2.contract.get_commitment().remainder_deadline;
+    set_time(&s2, deadline2 + 1);
+
+    assert_eq!(
+        s2.contract.try_fund_remainder(),
+        Err(Ok(Error::RemainderWindowPassed))
+    );
+    s2.contract.expire_remainder_window();
+    assert_eq!(s2.contract.get_status(), Status::Defaulted);
+}
+
 #[test]
 fn cannot_expire_remainder_window_if_already_funded() {
     let s = setup(1_500, 2_000);
@@ -1450,6 +1554,33 @@ fn cannot_reclaim_on_nondelivery_before_deadline() {
 
     let result = s.contract.try_reclaim_on_nondelivery();
     assert_eq!(result, Err(Ok(Error::DeliveryDeadlineNotPassed)));
+}
+
+/// #113 — the exact `delivery_deadline` boundary.
+///
+/// `reclaim_on_nondelivery`'s guard is `now <= delivery_deadline`, so the
+/// deadline second itself still belongs to the cooperative: the buyer's
+/// forfeiture right opens strictly after it.
+#[test]
+fn delivery_deadline_boundary_is_exclusive_for_reclaim_on_nondelivery() {
+    let s = setup(1_500, 2_000);
+    s.contract.lock();
+    let deadline = s.contract.get_commitment().delivery_deadline;
+    set_time(&s, deadline);
+
+    assert_eq!(
+        s.contract.try_reclaim_on_nondelivery(),
+        Err(Ok(Error::DeliveryDeadlineNotPassed))
+    );
+    // Refused, and nothing moved: the call is all-or-nothing at the boundary.
+    assert_eq!(s.contract.get_status(), Status::Locked);
+    assert!(s.token.balance(&s.contract.address) > 0);
+
+    // One second later it opens — proving the refusal above is the boundary
+    // itself, not a wider margin.
+    set_time(&s, deadline + 1);
+    s.contract.reclaim_on_nondelivery();
+    assert_eq!(s.contract.get_status(), Status::Forfeited);
 }
 
 #[test]
@@ -2343,6 +2474,47 @@ fn expire_dispute_window_rejects_before_the_deadline() {
 
     let result = s.contract.try_expire_dispute_window();
     assert_eq!(result, Err(Ok(Error::DisputeWindowNotPassed)));
+}
+
+/// #115 — the exact `dispute_deadline` boundary.
+///
+/// `expire_dispute_window`'s guard is `now <= dispute_deadline`, so the
+/// deadline second itself is still inside the freeze. `resolve_dispute` has
+/// no deadline guard at all — unanimous consent is its only gate — so it
+/// still succeeds in that same second. That pairing is what keeps the
+/// boundary second from being a dead zone where neither resume path works.
+#[test]
+fn dispute_deadline_boundary_keeps_resolve_open_and_expire_closed() {
+    // At exactly the deadline: timeout refused, unanimous resolve accepted.
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.flag_dispute(&s.buyer);
+    let deadline = s.contract.get_commitment().dispute_deadline;
+    assert!(deadline > 0, "flagging a dispute must open a deadline");
+    set_time(&s, deadline);
+
+    assert_eq!(
+        s.contract.try_expire_dispute_window(),
+        Err(Ok(Error::DisputeWindowNotPassed))
+    );
+    assert_eq!(s.contract.get_status(), Status::Disputed);
+    s.contract.resolve_dispute();
+    assert_eq!(s.contract.get_status(), Status::Locked);
+
+    // One second later the timeout path opens too, restoring the same
+    // pre-dispute status.
+    let s2 = setup(1_500, 1_500);
+    s2.contract.lock();
+    s2.contract.flag_dispute(&s2.buyer);
+    let deadline2 = s2.contract.get_commitment().dispute_deadline;
+    set_time(&s2, deadline2 + 1);
+
+    s2.contract.expire_dispute_window();
+    assert_eq!(s2.contract.get_status(), Status::Locked);
+    assert_eq!(
+        s2.contract.get_commitment().dispute_pre_status,
+        Status::Draft
+    );
 }
 
 #[test]

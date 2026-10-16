@@ -131,7 +131,17 @@ last session: `initialize` (now also takes `remainder_window_secs` and
 `reclaim_advance_1`/`_2`, `mark_checkpoint`, `settle`, `get_status`,
 `get_commitment`.
 
-Tests (`src/test.rs`, **138 tests, all passing** — see the "Last updated"
+Every real status transition also publishes a **`status_changed`** event
+(a `#[contractevent]` with `from`/`to` as topics — the shape SEP-41's
+`transfer` uses), added with the #68–#71 bundle. Emission is centralized
+in a private `set_status` helper — the single place `status` is assigned
+after `initialize` — so "every transition emits" holds by construction,
+not by convention. `initialize` deliberately emits nothing: a commitment
+being created in `Draft` is an initial state, not a transition into one.
+This is the primitive `api/`'s read-triggered cache refresh has been
+waiting for; shipped contract-side only, no consumer exists yet.
+
+Tests (`src/test.rs`, **143 tests, all passing** — see the "Last updated"
 entry for the count's history) cover, beyond last session's set: `lock` escrows
 only the deposit, not the full total; `ready_for_delivery` opens the window
 and is cooperative-gated; `fund_remainder` transfers exactly the remainder,
@@ -813,7 +823,39 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 16 Oct 2026 (evening) — bundled issue-response session
+*Last updated: 16 Oct 2026 (later evening) — bundled issue-response session
+(#68–#71), one contract-behavior change, one new test, two written/comment
+answers. **#69**: the contract now emits a **`status_changed` event on
+every real transition** (`#[contractevent]`, `from`/`to` as topics;
+`initialize` ships no event — creation is not a transition). All 13
+mutation sites route through a new private `set_status` helper, the only
+place `status` is assigned after `initialize`, so the property can't rot.
+Migration was mechanical — the behavior of every existing method is
+unchanged apart from the emitted event. One hard-won test-harness fact,
+recorded in `test.rs`: **`env.events().all()` scopes to the last contract
+invocation, not the whole test** (the trait doc means it literally — a
+first cut asserting the full accumulated sequence across ten calls
+failed against exactly the final call's event); the new `assert_transition`
+/ `assert_no_transition` helpers assert per-call, which also pins that
+non-transitions (claims, `fund_remainder`, `settle`'s payout) emit
+nothing. **#68**: `docs/constructor-batching.md` — recommendation is
+**not to add a `__constructor`**: on protocol 22+ every deploy invokes it,
+so a parameterized constructor is a breaking *replacement* for every
+existing deploy path (the API's bare deploy with empty `constructorArgs`
+would fail outright), it could only fold deploy+initialize (one
+`InvokeHostFunctionOp` per tx — initialize+lock batching is impossible),
+and the Draft window it would delete is exactly where PRD §4.9's
+`set_allocation` ledger must be written. Flip conditions and the full
+adoption ripple are listed in the doc. **#70**: genuine gap —
+`cannot_mark_checkpoint_twice` added. **#71**: already covered —
+answered with a comment naming
+`cannot_call_ready_for_delivery_before_advance_2_released`, no new test.
+138 → 143 tests. Snapshot note for whoever re-runs locally: this change
+makes several previously-`"events": []` snapshots re-record *with* the new
+event — deliberately not committed here, consistent with the record-only
+finding below.
+
+Prior entry: 16 Oct 2026 (evening) — bundled issue-response session
 (#64–#67), one contract-behavior change plus three written deliverables.
 **#65**: `grade_price_bps` (`initialize`) and `set_allocation`'s member
 list were the contract's only two unbounded `Vec` inputs — neither the

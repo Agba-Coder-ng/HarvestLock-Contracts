@@ -3296,3 +3296,229 @@ fn initialize_is_not_a_transition_and_publishes_nothing() {
     let s = setup(1_500, 1_500);
     assert_no_transition(&s);
 }
+
+// ---------- composition tests (#103-#106) ----------
+//
+// Each test below pairs two features that are each well covered on their own
+// happy path and checks the interaction between them — the cases that fall
+// between the two suites, where neither feature exercises the other already
+// being in flight.
+
+/// #103 — `reassign_buyer` rewrites only the commitment's `buyer` field. The
+/// allocation ledger lives under its own `DataKey::Allocation` instance entry
+/// and describes the cooperative's members, not who holds the buyer's
+/// position, so a novation must leave it exactly as recorded — and must not
+/// fail because of it either.
+#[test]
+fn reassign_buyer_leaves_a_recorded_allocation_ledger_completely_untouched() {
+    let s = setup(1_500, 1_500);
+    let members = Vec::from_array(&s.env, [member(&s.env, 6_000), member(&s.env, 4_000)]);
+    s.contract.set_allocation(&members);
+    s.contract.lock();
+    let recorded = s.contract.get_allocation();
+    s.contract.release_advance_1();
+
+    let new_buyer = Address::generate(&s.env);
+    s.contract.reassign_buyer(&new_buyer);
+
+    // Byte-for-byte the same ledger: same entries, same order, same hashes and
+    // same shares. Nothing was copied, re-keyed, or cleared.
+    let after = s.contract.get_allocation();
+    assert_eq!(after, recorded);
+    assert_eq!(after.len(), 2);
+    assert_eq!(after.get(0).unwrap(), recorded.get(0).unwrap());
+    assert_eq!(after.get(1).unwrap(), recorded.get(1).unwrap());
+
+    // Only `buyer` moved, and the new holder genuinely owns the position's
+    // buyer-only rights — the reassignment really landed, while the ledger sat
+    // untouched beside it.
+    assert_eq!(s.contract.get_commitment().buyer, new_buyer);
+    advance_time(&s, WINDOW + 1);
+    s.contract.reclaim_advance_1();
+    let advance1_amount = s.total_amount * 1_500 / 10_000;
+    assert_eq!(s.token.balance(&new_buyer), advance1_amount);
+    assert_eq!(s.contract.get_allocation(), recorded);
+}
+
+/// #104 — `flag_dispute` from `Delivered` while the FX-shortfall funding window
+/// is still open. The freeze blocks `settle` and the shortfall calls
+/// themselves (all status-gated), but per `flag_dispute`'s documented
+/// limitation it does *not* pause `fx_shortfall_deadline`: that deadline keeps
+/// running on absolute time, so a dispute outliving it lands on the default
+/// path instead of buying the buyer a free extension.
+#[test]
+fn flag_dispute_during_an_open_fx_shortfall_window_freezes_settle_without_disturbing_the_deadline() {
+    let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s);
+    s.contract.resolve_fx_shortfall();
+
+    let before = s.contract.get_commitment();
+    assert_eq!(before.fx_shortfall_amount, EXPECTED_SHORTFALL);
+    assert!(!before.fx_shortfall_funded);
+    let shortfall_deadline = before.fx_shortfall_deadline;
+    assert!(
+        shortfall_deadline > s.env.ledger().timestamp(),
+        "precondition: the shortfall funding window is still open"
+    );
+
+    s.contract.flag_dispute(&s.buyer);
+    assert_eq!(s.contract.get_status(), Status::Disputed);
+
+    // Everything the open window would otherwise allow is frozen — by the
+    // status gate, before any of the window's own guards get a chance to speak.
+    assert_eq!(s.contract.try_settle(), Err(Ok(Error::InvalidState)));
+    assert_eq!(
+        s.contract.try_fund_fx_shortfall(),
+        Err(Ok(Error::InvalidState))
+    );
+    assert_eq!(
+        s.contract.try_expire_fx_shortfall_window(),
+        Err(Ok(Error::InvalidState))
+    );
+
+    // …but only `status` was frozen. The shortfall's own deadline and amount
+    // are exactly as they were: nothing extended, no clock reset.
+    let frozen = s.contract.get_commitment();
+    assert_eq!(frozen.fx_shortfall_deadline, shortfall_deadline);
+    assert_eq!(frozen.fx_shortfall_amount, EXPECTED_SHORTFALL);
+    assert!(!frozen.fx_shortfall_funded);
+    assert_eq!(frozen.dispute_pre_status, Status::Delivered);
+
+    // Let the dispute lapse *after* the shortfall deadline passed.
+    advance_time(&s, REMAINDER_WINDOW + 1);
+    s.contract.expire_dispute_window();
+    assert_eq!(s.contract.get_status(), Status::Delivered);
+
+    // Curing the shortfall is now too late: the deadline kept running through
+    // the freeze, which is the limitation, checked for this specific pair.
+    assert_eq!(
+        s.contract.try_fund_fx_shortfall(),
+        Err(Ok(Error::FxShortfallWindowPassed))
+    );
+
+    // And the consequence that deadline was always gating is reachable: the
+    // escrow sweeps to the cooperative and the buyer defaults.
+    s.contract.expire_fx_shortfall_window();
+    assert_eq!(s.contract.get_status(), Status::Defaulted);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    // Deposit + remainder escrowed (1_000_000) less the 300_000 the
+    // cooperative already claimed across the two tranches.
+    assert_eq!(s.token.balance(&s.cooperative), 1_000_000);
+}
+
+/// #105 — `cancel` after an allocation has been recorded. `cancel` unwinds the
+/// *commitment* — its status and whatever balance is escrowed — and knows
+/// nothing about `DataKey::Allocation`; cleaning that up is not its job. The
+/// recorded hashes therefore outlive the deal they described and simply become
+/// meaningless: still on-chain, still unlinkable from people (the salts live
+/// off-chain), and permanently orphaned — not an error, and not a reason for
+/// `cancel` to fail.
+#[test]
+fn cancel_after_an_allocation_is_recorded_leaves_the_ledger_orphaned_not_an_error() {
+    let s = setup(1_500, 1_500);
+    let members = Vec::from_array(&s.env, [member(&s.env, 6_000), member(&s.env, 4_000)]);
+    s.contract.set_allocation(&members);
+    s.contract.lock();
+    let recorded = s.contract.get_allocation();
+
+    // Cancel with an escrowed deposit and an allocation already on record.
+    s.contract.cancel();
+
+    // The unwind succeeded as if no allocation existed at all — it was never
+    // consulted, so it could not block or alter the cancellation.
+    assert_eq!(s.contract.get_status(), Status::Cancelled);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(s.token.balance(&s.buyer), s.total_amount);
+    assert_eq!(s.token.balance(&s.cooperative), 0);
+
+    // The entry survived untouched: `get_allocation` still answers with the
+    // same ledger even though the commitment it belonged to is dead.
+    let after = s.contract.get_allocation();
+    assert_eq!(after, recorded);
+    assert_eq!(after.len(), 2);
+    assert_eq!(after.get(0).unwrap(), recorded.get(0).unwrap());
+
+    // And it was not swept away as part of the unwind — there is no cleanup
+    // path for it, so the orphan is permanent. Read through the contract's own
+    // storage context, since the entry is instance-scoped to it.
+    let still_recorded = s.env.as_contract(&s.contract.address, || {
+        s.env.storage().instance().has(&DataKey::Allocation)
+    });
+    assert!(still_recorded);
+
+    // A second `set_allocation` still rejects, but with `InvalidState`: the
+    // terminal status is checked first, so the allocation guard is never even
+    // reached. The ledger is unreachable-by-writing as well as meaningless.
+    let other = Vec::from_array(&s.env, [member(&s.env, 10_000)]);
+    assert_eq!(
+        s.contract.try_set_allocation(&other),
+        Err(Ok(Error::InvalidState))
+    );
+    // Cancellation is terminal on its own account, not because of the ledger.
+    assert_eq!(s.contract.try_cancel(), Err(Ok(Error::InvalidState)));
+    assert_eq!(s.contract.try_lock(), Err(Ok(Error::InvalidState)));
+}
+
+/// #106 — `resolve_dispute` restoring the hardest pre-dispute status:
+/// `ReadyForDelivery`, i.e. mid-way through the two-phase-funding window with
+/// the remainder still unfunded. The freeze lands on top of a clock only the
+/// buyer can satisfy, so restoring must bring back that exact window state —
+/// same absolute deadline, still unfunded — not just a plausible-looking
+/// status. The simpler earlier states have their own coverage; this is the one
+/// where a restored-but-broken window would silently cost the cooperative the
+/// deal.
+#[test]
+fn resolve_dispute_restores_a_ready_for_delivery_commitment_still_inside_its_funding_window() {
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.release_advance_1();
+    s.contract.claim_advance_1();
+    s.contract.mark_checkpoint();
+    s.contract.release_advance_2();
+    s.contract.claim_advance_2();
+    s.contract.ready_for_delivery();
+
+    let mid_window = s.contract.get_commitment();
+    assert_eq!(mid_window.status, Status::ReadyForDelivery);
+    assert!(!mid_window.remainder_funded);
+    let remainder_deadline = mid_window.remainder_deadline;
+    assert!(
+        remainder_deadline > s.env.ledger().timestamp(),
+        "precondition: the remainder funding window is still open"
+    );
+
+    // Freeze it while the buyer's outstanding funding obligation is live.
+    s.contract.flag_dispute(&s.warehouse);
+    assert_eq!(s.contract.get_status(), Status::Disputed);
+    assert_eq!(
+        s.contract.try_fund_remainder(),
+        Err(Ok(Error::InvalidState))
+    );
+
+    // Unanimous resolution restores the precise mid-window state.
+    s.contract.resolve_dispute();
+    let restored = s.contract.get_commitment();
+    assert_eq!(restored.status, Status::ReadyForDelivery);
+    assert_eq!(restored.dispute_pre_status, Status::Draft);
+    assert_eq!(restored.dispute_deadline, 0);
+    // Same absolute deadline — the dispute neither paused nor extended it…
+    assert_eq!(restored.remainder_deadline, remainder_deadline);
+    // …and the funding flag survived the round trip as still-unfunded.
+    assert!(!restored.remainder_funded);
+
+    // The restored state is live, not merely displayable: the buyer can still
+    // meet the obligation inside the window it always had, and the deal then
+    // runs to settlement as it would have without the dispute.
+    s.contract.fund_remainder();
+    assert!(s.contract.get_commitment().remainder_funded);
+
+    s.contract.confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
+    s.contract.settle();
+    assert_eq!(s.contract.get_status(), Status::Settled);
+
+    // Both tranches (300_000) plus the remainder (700_000) all land with the
+    // cooperative at full delivery and full grade; nothing is stranded.
+    assert_eq!(s.token.balance(&s.cooperative), s.total_amount);
+    assert_eq!(s.token.balance(&s.buyer), 0);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+}

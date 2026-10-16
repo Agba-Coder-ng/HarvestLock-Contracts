@@ -23,6 +23,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check Rust formatting
+        run: cargo fmt --check --manifest-path contracts/escrow/Cargo.toml
+
       - name: Cache cargo
         uses: actions/cache@v6
         with:
@@ -104,3 +107,52 @@ jobs:
       # one entirely.
       - name: Guard public method auth doc comments
         run: bash .github/scripts/check_auth_docs.sh
+
+  # Differential testing across Soroban SDK minor versions
+  sdk-differential-test:
+    name: Differential SDK Version Testing
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        soroban-version: [28.0.0, 29.0.1]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.soroban-version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.soroban-version }}-
+
+      - name: Update soroban-sdk version
+        run: |
+          cd contracts/escrow
+          # Update both dependencies and dev-dependencies
+          sed -i 's/soroban-sdk = "[^"]*"/soroban-sdk = "${{ matrix.soroban-version }}"/' Cargo.toml
+          sed -i 's/soroban-sdk = { version = "[^"]*"',/soroban-sdk = { version = "${{ matrix.soroban-version }}",/' Cargo.toml
+
+      - name: Verify updated version
+        working-directory: contracts/escrow
+        run: |
+          echo "Updated Cargo.toml:"
+          grep -A2 -B2 "soroban-sdk" Cargo.toml
+
+      - name: cargo test
+        working-directory: contracts/escrow
+        run: cargo test --verbose
+
+      # Revert Cargo.toml changes to avoid polluting the repository
+      # (this job runs on a copy, so technically not needed, but good practice)
+      - name: Revert Cargo.toml changes
+        if: always()
+        run: |
+          cd contracts/escrow
+          git checkout Cargo.toml

@@ -1,8 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{Address as _, BytesN as _, Ledger as _, MockAuth, MockAuthInvoke};
-use soroban_sdk::{Env, IntoVal, Val};
+use soroban_sdk::testutils::{
+    Address as _, BytesN as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke,
+};
+use soroban_sdk::{xdr, Env, Event as _, IntoVal, Val};
 
 const WINDOW: u64 = 7 * 24 * 60 * 60; // 7 days, arbitrary but realistic
 const REMAINDER_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 days — matches the app-level default
@@ -1162,6 +1164,19 @@ fn cannot_reclaim_after_cooperative_already_claimed() {
 
     let result = s.contract.try_reclaim_advance_1();
     assert_eq!(result, Err(Ok(Error::AlreadyClaimed)));
+}
+
+// ---------- mark_checkpoint ----------
+
+#[test]
+fn cannot_mark_checkpoint_twice() {
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.release_advance_1();
+    s.contract.mark_checkpoint();
+
+    let result = s.contract.try_mark_checkpoint();
+    assert_eq!(result, Err(Ok(Error::InvalidState)));
 }
 
 // ---------- ready_for_delivery / fund_remainder (two-phase funding) ----------
@@ -2974,4 +2989,119 @@ fn dispute_resolve_and_expire_race_leaves_consistent_state_regardless_of_order()
         Status::Draft
     );
     assert_eq!(s2.contract.get_commitment().dispute_deadline, 0);
+}
+
+// ---------- status_changed events (#69) ----------
+
+/// The XDR form of one `status_changed` event, the encoding
+/// `env.events().all()` compares against — this asserts on the exact
+/// `(from, to)` pair the contract published, not just "an event fired".
+fn status_event(s: &Setup, from: Status, to: Status) -> xdr::ContractEvent {
+    StatusChanged { from, to }.to_xdr(&s.env, &s.contract.address)
+}
+
+/// Asserts the escrow contract's most recent invocation published exactly
+/// one `status_changed` event, `from -> to` — `env.events().all()` scopes
+/// to the last invocation, so this doubles as the "and nothing else was
+/// published by that call" check. Filtered by contract because the SAC
+/// token's own transfer events land in the same stream whenever funds move.
+fn assert_transition(s: &Setup, from: Status, to: Status) {
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&s.contract.address),
+        [status_event(s, from, to)]
+    );
+}
+
+/// Asserts the escrow contract's most recent invocation published no
+/// `status_changed` — a call moved funds, set a clock, or created the
+/// commitment without being a state transition.
+fn assert_no_transition(s: &Setup) {
+    assert!(s
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&s.contract.address)
+        .events()
+        .is_empty());
+}
+
+#[test]
+fn every_transition_publishes_status_changed() {
+    // Walks the full lifecycle asserting each call's event immediately.
+    // Because each call is checked right after it runs, the chain is also
+    // verified in order: every assertion's `from` is the previous
+    // assertion's `to`.
+    let s = setup(1_500, 2_000);
+    s.contract.lock();
+    assert_transition(&s, Status::Draft, Status::Locked);
+    s.contract.release_advance_1();
+    assert_transition(&s, Status::Locked, Status::Advance1Released);
+    s.contract.claim_advance_1();
+    assert_no_transition(&s); // moves funds, status unchanged
+    s.contract.mark_checkpoint();
+    assert_transition(&s, Status::Advance1Released, Status::CheckpointPassed);
+    s.contract.release_advance_2();
+    assert_transition(&s, Status::CheckpointPassed, Status::Advance2Released);
+    s.contract.claim_advance_2();
+    assert_no_transition(&s);
+    s.contract.ready_for_delivery();
+    assert_transition(&s, Status::Advance2Released, Status::ReadyForDelivery);
+    s.contract.fund_remainder();
+    assert_no_transition(&s);
+    s.contract
+        .confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
+    assert_transition(&s, Status::ReadyForDelivery, Status::Delivered);
+    s.contract.settle();
+    assert_transition(&s, Status::Delivered, Status::Settled);
+}
+
+#[test]
+fn dispute_freeze_and_resume_publish_status_changed() {
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.flag_dispute(&s.buyer);
+    assert_transition(&s, Status::Locked, Status::Disputed);
+    s.contract.resolve_dispute();
+    // The resume event's `to` is the restored pre-dispute status, not
+    // Draft — the same restoration `status` itself gets, mirrored into
+    // the event.
+    assert_transition(&s, Status::Disputed, Status::Locked);
+}
+
+#[test]
+fn unwind_and_default_paths_publish_status_changed() {
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.cancel();
+    assert_transition(&s, Status::Locked, Status::Cancelled);
+
+    let s2 = setup(1_500, 1_500);
+    s2.contract.lock();
+    advance_time(&s2, DELIVERY_WINDOW + 1);
+    s2.contract.reclaim_on_nondelivery();
+    assert_transition(&s2, Status::Locked, Status::Forfeited);
+
+    // The remainder window lapses without fund_remainder — buyer default.
+    // Claims are deliberately skipped: they emit nothing (asserted in
+    // every_transition_publishes_status_changed) and no guard on this path
+    // depends on them.
+    let s3 = setup(1_500, 2_000);
+    s3.contract.lock();
+    s3.contract.release_advance_1();
+    s3.contract.mark_checkpoint();
+    s3.contract.release_advance_2();
+    s3.contract.ready_for_delivery();
+    advance_time(&s3, REMAINDER_WINDOW + 1);
+    s3.contract.expire_remainder_window();
+    assert_transition(&s3, Status::ReadyForDelivery, Status::Defaulted);
+}
+
+#[test]
+fn initialize_is_not_a_transition_and_publishes_nothing() {
+    // A commitment being created in Draft is an initial state, not a
+    // transition into one — see StatusChanged's doc comment. This pins
+    // that decision: initialize emits nothing for an off-chain consumer
+    // to key a "created" event on, deliberately.
+    let s = setup(1_500, 1_500);
+    assert_no_transition(&s);
 }

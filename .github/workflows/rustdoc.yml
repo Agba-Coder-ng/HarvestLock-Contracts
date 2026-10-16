@@ -1,0 +1,61 @@
+name: rustdoc
+
+on:
+  push:
+    branches: [main]
+  # Manual rerun without a push (e.g. to republish after a Pages setting change).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Required by actions/deploy-pages.
+  pages: write
+  id-token: write
+
+# Only one publish at a time; a newer push to main supersedes an in-flight build.
+concurrency:
+  group: rustdoc-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-doc-
+
+      # --no-deps keeps the published site to this crate's own docs (the
+      # contract's doc comments) rather than the full soroban-sdk tree.
+      - name: Build rustdoc
+        run: cargo doc -p harvestlock-escrow --no-deps
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy:
+    name: publish to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,42 @@
+# #125 snapshot: HANDOFF.md Deployment 6 — partial delivery plus grade adjustment.
+snapshot = deployment-6-partial-delivery-grade-adjustment
+provenance = derived from HANDOFF.md "Verified on testnet", Deployment 6, contract
+   CBDDWE4CKHAAFZPNNUVZRCHKAJQ3F2PMQA547LMPPM6ULRZJ6AKAHXAQ: 100,000,000 stroops,
+   15%/20% split, contracted_quantity 1000, grade_price_bps [10000, 9000, 7500],
+   `confirm_delivery` at delivered_quantity 500 / grade_index 1 giving
+   settlement_bps 4500, and `settle` transferring 10,000,000 to the cooperative
+   and 55,000,000 back to the buyer. Every one of those numbers was read back
+   from the ledger, per HANDOFF.md; no transaction XDR was captured.
+total_amount = 100000000
+advance1_bps = 1500
+advance2_bps = 2000
+claim_window_secs = 604800
+remainder_window_secs = 604800
+delivery_window_secs = 1036800
+contracted_quantity = 1000
+grade_price_bps = 10000,9000,7500
+buyer_mint = 100000000
+
+step = lock => ok
+step = release_advance_1 => ok
+step = claim_advance_1 => ok
+check = coop_balance 15000000
+step = mark_checkpoint => ok
+step = release_advance_2 => ok
+step = claim_advance_2 => ok
+check = coop_balance 35000000
+step = ready_for_delivery => ok
+step = fund_remainder => ok
+step = confirm_delivery 500 1 => ok
+# recorded: settlement_bps 4500 (50% quantity x 90% grade) confirmed by a
+# `get_commitment` read before `settle` ran.
+check = settlement_bps 4500
+check = delivered_quantity 500
+step = settle => ok
+# recorded on-chain transfer events: 10,000,000 to the cooperative, 55,000,000
+# back to the buyer — exactly adjusted_total (45,000,000) minus already_claimed
+# (35,000,000), with the rest of the remainder refunded.
+check = coop_balance 45000000
+check = buyer_balance 55000000
+check = contract_balance 0
+check = status Settled

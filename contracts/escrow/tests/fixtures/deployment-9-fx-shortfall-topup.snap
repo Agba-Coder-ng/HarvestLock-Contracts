@@ -1,0 +1,53 @@
+# #125 snapshot: HANDOFF.md Deployment 9 — the live GBP/USD-rate FX top-up.
+snapshot = deployment-9-fx-shortfall-topup
+provenance = derived from HANDOFF.md "Verified on testnet", Deployment 9, contract
+   CBOZLCNHWFHTK24WO7RCDBEWUFV6LWQKZFHJUIOZZRVBMNRTGLXRMKKH: denominated_amount
+   100,000,000 against a total_amount of 100,000,000, oracle_config pointed at the
+   real Reflector testnet fiat oracle (GBP), and the live quote recorded there —
+   price 135300006985028 at 14 decimals, i.e. 1.35300006985028 USD per GBP.
+   `resolve_fx_shortfall` computed fx_adjusted_total 135,300,006 and
+   fx_shortfall_amount 35,300,006 on chain; `fund_fx_shortfall` moved exactly
+   35,300,006 and `settle` paid the cooperative 105,300,006, for a cooperative
+   total of exactly 135,300,006. This fixture feeds the *same recorded rate* back
+   through a fixture oracle: the rate is genuine chain data, the transport is not
+   (no transaction XDR was captured).
+total_amount = 100000000
+advance1_bps = 1500
+advance2_bps = 1500
+claim_window_secs = 604800
+remainder_window_secs = 604800
+delivery_window_secs = 1036800
+contracted_quantity = 1000
+grade_price_bps = 10000,9000,7500
+oracle = GBP,100000000,3600,135300006985028,14
+buyer_mint = 200000000
+
+step = lock => ok
+step = release_advance_1 => ok
+step = claim_advance_1 => ok
+check = coop_balance 15000000
+step = mark_checkpoint => ok
+step = release_advance_2 => ok
+step = claim_advance_2 => ok
+check = coop_balance 30000000
+step = ready_for_delivery => ok
+step = fund_remainder => ok
+check = contract_balance 70000000
+step = confirm_delivery 1000 0 => ok
+step = resolve_fx_shortfall => ok
+# recorded figures, reproduced from the recorded live rate:
+check = fx_resolved true
+check = fx_adjusted_total 135300006
+check = fx_shortfall_amount 35300006
+check = fx_shortfall_funded false
+# the guard HANDOFF.md describes: settle refuses until the top-up lands.
+step = settle => err(FxShortfallUnfunded)
+step = fund_fx_shortfall => ok
+check = contract_balance 105300006
+step = settle => ok
+# recorded: cooperative's total across all three payments = 15,000,000 +
+# 15,000,000 + 105,300,006 = 135,300,006, exactly fx_adjusted_total.
+check = coop_balance 135300006
+check = contract_balance 0
+check = buyer_balance 64699994
+check = status Settled

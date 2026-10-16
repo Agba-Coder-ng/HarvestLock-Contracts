@@ -96,7 +96,8 @@ mod reflector;
 
 use reflector::{Asset as ReflectorAsset, ReflectorPulseClient};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, BytesN,
+    Env, Symbol, Vec,
 };
 
 /// Maximum number of entries `initialize` accepts in `grade_price_bps`.
@@ -486,6 +487,36 @@ pub struct Commitment {
     pub dispute_deadline: u64,
 }
 
+/// Published on every real status transition — `lock`, both advance
+/// releases, checkpoint, delivery confirmation, settlement, cancellation,
+/// both default paths, and the dispute freeze/resume pair. Every emission
+/// point is `set_status` (the only place `status` is assigned after
+/// `initialize`), so a future transition gets an event by construction
+/// rather than by remembering to add one.
+///
+/// Both statuses ride as topics, in the shape SEP-41's `transfer` uses
+/// (indexed dimensions first, payload second): an off-chain consumer can
+/// topic-filter for a specific transition — e.g. everything that just
+/// became `Defaulted` — instead of fetching every event and decoding data.
+/// `initialize` deliberately doesn't emit: a commitment being created in
+/// `Draft` is an initial state, not a transition into one.
+///
+/// Added for #69, which asked whether an indexer would benefit: none
+/// exists yet, but the API's cache is read-triggered precisely because
+/// there is no cheaper way to learn about a state change (see
+/// `api/HANDOFF.md`), and this is the primitive that changes that
+/// trade-off — everything else that would consume these events is
+/// deliberately deferred app-side work, not a reason to withhold the
+/// event surface itself.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusChanged {
+    #[topic]
+    pub from: Status,
+    #[topic]
+    pub to: Status,
+}
+
 #[contract]
 pub struct EscrowContract;
 
@@ -735,7 +766,7 @@ impl EscrowContract {
         // The standard SAC/native token used here has no such hook — this
         // is defensive hardening against a future token type, not a
         // response to a demonstrated exploit against the current one.
-        c.status = Status::Locked;
+        Self::set_status(&env, &mut c, Status::Locked);
         Self::save(&env, &c);
 
         if deposit > 0 {
@@ -783,7 +814,7 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
         c.warehouse_operator.require_auth();
-        c.status = Status::CheckpointPassed;
+        Self::set_status(&env, &mut c, Status::CheckpointPassed);
         Self::save(&env, &c);
         Ok(())
     }
@@ -826,7 +857,7 @@ impl EscrowContract {
         }
         c.cooperative.require_auth();
         c.remainder_deadline = env.ledger().timestamp() + c.remainder_window_secs;
-        c.status = Status::ReadyForDelivery;
+        Self::set_status(&env, &mut c, Status::ReadyForDelivery);
         Self::save(&env, &c);
         Ok(())
     }
@@ -891,7 +922,7 @@ impl EscrowContract {
         }
 
         // Effects before interaction — see `lock`'s comment for why.
-        c.status = Status::Defaulted;
+        Self::set_status(&env, &mut c, Status::Defaulted);
         Self::save(&env, &c);
 
         let token_client = token::Client::new(&env, &c.token);
@@ -929,7 +960,7 @@ impl EscrowContract {
         c.buyer.require_auth();
 
         // Effects before interaction — see `lock`'s comment for why.
-        c.status = Status::Forfeited;
+        Self::set_status(&env, &mut c, Status::Forfeited);
         Self::save(&env, &c);
 
         let token_client = token::Client::new(&env, &c.token);
@@ -981,7 +1012,7 @@ impl EscrowContract {
         c.delivered_quantity = delivered_quantity;
         c.grade_index = grade_index;
         c.settlement_bps = (quantity_bps as i128 * grade_bps as i128 / 10_000) as u32;
-        c.status = Status::Delivered;
+        Self::set_status(&env, &mut c, Status::Delivered);
         Self::save(&env, &c);
         Ok(())
     }
@@ -1067,7 +1098,7 @@ impl EscrowContract {
         let owed_from_remainder = (adjusted_total - claimed_by_coop).max(0);
 
         // Effects before interaction — see `lock`'s comment for why.
-        c.status = Status::Settled;
+        Self::set_status(&env, &mut c, Status::Settled);
         Self::save(&env, &c);
 
         let token_client = token::Client::new(&env, &c.token);
@@ -1230,7 +1261,7 @@ impl EscrowContract {
         }
 
         // Effects before interaction — see `lock`'s comment for why.
-        c.status = Status::Defaulted;
+        Self::set_status(&env, &mut c, Status::Defaulted);
         Self::save(&env, &c);
 
         let token_client = token::Client::new(&env, &c.token);
@@ -1259,8 +1290,10 @@ impl EscrowContract {
     /// via the same balance-based transfer `settle` uses, so it's correct
     /// regardless of claim/reclaim history or how much of the deposit vs.
     /// remainder had been funded. "Logged": the state transition and the
-    /// transfer both land on the ledger from this call — no separate event
-    /// needed, same as every other transition here.
+    /// transfer both land on the ledger from this call — the transition
+    /// additionally emits `status_changed` like every other transition
+    /// (`set_status`), so an indexer sees the cancellation without having
+    /// to inspect the balance change.
     pub fn cancel(env: Env) -> Result<(), Error> {
         let mut c = Self::load(&env)?;
         match c.status {
@@ -1275,7 +1308,7 @@ impl EscrowContract {
         Self::require_once_each(&[&c.buyer, &c.cooperative]);
 
         // Effects before interaction — see `lock`'s comment for why.
-        c.status = Status::Cancelled;
+        Self::set_status(&env, &mut c, Status::Cancelled);
         Self::save(&env, &c);
 
         let token_client = token::Client::new(&env, &c.token);
@@ -1380,7 +1413,7 @@ impl EscrowContract {
 
         c.dispute_pre_status = c.status;
         c.dispute_deadline = env.ledger().timestamp() + c.remainder_window_secs;
-        c.status = Status::Disputed;
+        Self::set_status(&env, &mut c, Status::Disputed);
         Self::save(&env, &c);
         Ok(())
     }
@@ -1402,9 +1435,10 @@ impl EscrowContract {
         }
         Self::require_once_each(&[&c.buyer, &c.cooperative, &c.warehouse_operator]);
 
-        c.status = c.dispute_pre_status;
+        let restored = c.dispute_pre_status;
         c.dispute_pre_status = Status::Draft;
         c.dispute_deadline = 0;
+        Self::set_status(&env, &mut c, restored);
         Self::save(&env, &c);
         Ok(())
     }
@@ -1430,9 +1464,10 @@ impl EscrowContract {
             return Err(Error::DisputeWindowNotPassed);
         }
 
-        c.status = c.dispute_pre_status;
+        let restored = c.dispute_pre_status;
         c.dispute_pre_status = Status::Draft;
         c.dispute_deadline = 0;
+        Self::set_status(&env, &mut c, restored);
         Self::save(&env, &c);
         Ok(())
     }
@@ -1458,6 +1493,16 @@ impl EscrowContract {
 
     fn save(env: &Env, c: &Commitment) {
         env.storage().instance().set(&DataKey::Commitment, c);
+    }
+
+    /// The one place `status` is assigned after `initialize` — assigns and
+    /// publishes the `status_changed` event together, so the "every real
+    /// transition emits an event" property in `StatusChanged`'s doc holds by
+    /// construction, not by convention.
+    fn set_status(env: &Env, c: &mut Commitment, next: Status) {
+        let from = c.status;
+        c.status = next;
+        StatusChanged { from, to: next }.publish(env);
     }
 
     fn bps_amount(total: i128, bps: u32) -> i128 {
@@ -1558,7 +1603,7 @@ impl EscrowContract {
         }
         let deadline = env.ledger().timestamp() + c.claim_window_secs;
         Self::set_tranche_deadline(&mut c, t, deadline);
-        c.status = next;
+        Self::set_status(env, &mut c, next);
         Self::save(env, &c);
         Ok(())
     }

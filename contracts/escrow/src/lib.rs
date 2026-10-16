@@ -175,8 +175,9 @@ pub enum Error {
     /// never what a caller actually wants (that's what leaving
     /// `oracle_config` as `None` is for).
     InvalidOracleConfig = 24,
-    /// `oracle_rate` called but `initialize` never set an `oracle_config`
-    /// for this commitment.
+    /// `oracle_rate` or `resolve_fx_shortfall` called but `initialize`
+    /// never set an `oracle_config` for this commitment — the only two
+    /// functions that read the oracle at all (#124).
     OracleNotConfigured = 25,
     /// The configured Reflector oracle returned `None` for
     /// `oracle_config.price_asset` — it doesn't quote that asset at all

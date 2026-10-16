@@ -34,9 +34,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # --locked: fail rather than silently re-resolve if Cargo.lock is out
+      # of sync with Cargo.toml -- a dependency must never float between a
+      # local build and CI's build (issue #91).
       - name: cargo test
         working-directory: contracts/escrow
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
   build-wasm:
     name: stellar contract build
@@ -74,9 +77,11 @@ jobs:
       - name: Install Stellar CLI
         run: cargo install --locked stellar-cli
 
+      # --locked: same reasoning as the test job above -- the wasm must be
+      # built from the same pinned dependency set the rest of CI uses.
       - name: stellar contract build
         working-directory: .
-        run: stellar contract build
+        run: stellar contract build --locked
 
   # Regression safety nets one layer up from `cargo test`: both guard a
   # class of problem no single hand-written test is positioned to catch

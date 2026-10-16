@@ -141,7 +141,7 @@ being created in `Draft` is an initial state, not a transition into one.
 This is the primitive `api/`'s read-triggered cache refresh has been
 waiting for; shipped contract-side only, no consumer exists yet.
 
-Tests (`src/test.rs`, **143 tests, all passing** — see the "Last updated"
+Tests (`src/test.rs`, **147 tests, all passing** — see the "Last updated"
 entry for the count's history) cover, beyond last session's set: `lock` escrows
 only the deposit, not the full total; `ready_for_delivery` opens the window
 and is cooperative-gated; `fund_remainder` transfers exactly the remainder,
@@ -823,7 +823,31 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 16 Oct 2026 (later evening) — bundled issue-response session
+*Last updated: 16 Oct 2026 (night) — exact-deadline boundary coverage for all
+four absolute deadlines (#112–#115): tests only, plus doc-comment corrections,
+no contract behavior changed. Each of `remainder_deadline`,
+`delivery_deadline`, `fx_shortfall_deadline` and `dispute_deadline` now has a
+test that reads the deadline back out of contract state, sets the ledger clock
+to exactly that timestamp, and asserts both sides of it — previously every
+deadline test used a clearly-before/clearly-after pair, so the
+exclusive/inclusive edge each guard implements was never actually proven.
+What the four guards do, now stated in `lib.rs` instead of left implicit: the
+deadline second is the *last* second the original window is open
+(`fund_remainder` and `fund_fx_shortfall` inclusive; `resolve_dispute` carries
+no deadline gate at all), and every deadline-triggered failure path
+(`expire_remainder_window`, `expire_fx_shortfall_window`,
+`reclaim_on_nondelivery`, `expire_dispute_window`) needs `now` strictly greater
+than the deadline. Confirming that surfaced two doc contradictions, both
+fixed: `FxShortfallWindowNotPassed` said "called before the deadline" while its
+guard is `now <= deadline`, and `DisputeWindowNotPassed`'s wording implied
+`resolve_dispute` could produce it, which it can't. Mutation-checked before
+committing: flipping any of the four comparison operators, or loosening either
+funding guard by one second, turns the corresponding test red — these tests
+pin the boundary rather than passing vacuously. 143 → 147 tests. Snapshots for
+the four new tests once again deliberately **not committed** — same
+record-only reasoning recorded in the prior entry below.
+
+Prior entry: 16 Oct 2026 (later evening) — bundled issue-response session
 (#68–#71), one contract-behavior change, one new test, two written/comment
 answers. **#69**: the contract now emits a **`status_changed` event on
 every real transition** (`#[contractevent]`, `from`/`to` as topics;

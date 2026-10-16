@@ -24,10 +24,14 @@ anything that depends on one still existing.
 Changes since Deployment 10, none of which uploaded a new WASM: auth-model
 scrutiny of the staged multi-party flow (#138–#141, which surfaced and fixed a
 real overlapping-role bug in `cancel`/`reassign_buyer`/`resolve_dispute`),
-edge-case coverage (#130–#133), the `Commitment`-footprint audit (#143),
-dispatch-cost benchmarks, and two CI guard scripts (Error-discriminant
-stability, public-method auth doc completeness). No deployment entry until
-the next build goes to testnet.
+edge-case coverage (#130–#133), exact-boundary coverage at the deadline second
+itself for all four absolute deadlines (`remainder_deadline`,
+`delivery_deadline`, `fx_shortfall_deadline`, `dispute_deadline`; #112–#115,
+with the inclusive/exclusive rule now stated in the doc comments rather than
+left implicit), the `Commitment`-footprint audit (#143), dispatch-cost
+benchmarks, and two CI guard scripts (Error-discriminant stability,
+public-method auth doc completeness). No deployment entry until the next
+build goes to testnet.
 
 ## [Deployment 10] — 2026-09-06
 

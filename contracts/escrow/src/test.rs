@@ -209,6 +209,65 @@ fn cannot_initialize_twice() {
     assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
 }
 
+/// #94 — `initialize()` deliberately does not require the three named parties
+/// (`buyer`, `cooperative`, `warehouse_operator`) to hold distinct addresses.
+/// Its guard clauses validate the economic parameters and the buyer's
+/// signature; none of them compare the party addresses, so a single principal
+/// holding all three roles initializes successfully and lands in `Draft`.
+///
+/// This is intentional, not an unconsidered gap. Role separation in this
+/// contract is enforced where it matters — at each state transition, by that
+/// role's own `require_auth()` — rather than by a distinctness check at
+/// creation. Collapsing the three roles onto one principal is a deployment
+/// choice (a cooperative that also runs the warehouse, or a minimal test
+/// deployment); the contract records the parties it is handed and does not
+/// second-guess them. The consequence is documented rather than hidden: with
+/// one principal in all three roles, every multi-party consent gate reduces to
+/// that single signer, which the companion auth-model test
+/// `all_three_identical_parties_accept_only_that_principals_signature` pins
+/// down. This test asserts the creation half of that same fact directly.
+#[test]
+fn initialize_allows_buyer_cooperative_and_warehouse_to_be_one_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let one_principal = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, _token, _admin) = create_token(&env, &token_admin);
+
+    let contract_id = env.register(EscrowContract, ());
+    let contract = EscrowContractClient::new(&env, &contract_id);
+
+    let result = contract.try_initialize(
+        &one_principal,
+        &one_principal,
+        &one_principal,
+        &token_address,
+        &1_000_000,
+        &1_000,
+        &1_000,
+        &WINDOW,
+        &REMAINDER_WINDOW,
+        &DELIVERY_WINDOW,
+        &CONTRACTED_QUANTITY,
+        &Vec::from_array(&env, GRADE_PRICE_BPS),
+        &None,
+    );
+    assert_eq!(
+        result,
+        Ok(Ok(())),
+        "initialize must accept the all-identical party shape (no distinctness guard)"
+    );
+    assert_eq!(contract.get_status(), Status::Draft);
+
+    // The three stored roles are the same address the caller passed — the
+    // contract faithfully records the degenerate shape rather than rewriting or
+    // rejecting it.
+    let commitment = contract.get_commitment();
+    assert_eq!(commitment.buyer, one_principal);
+    assert_eq!(commitment.cooperative, one_principal);
+    assert_eq!(commitment.warehouse_operator, one_principal);
+}
+
 #[test]
 fn zero_claim_window_rejected_at_initialize() {
     let env = Env::default();

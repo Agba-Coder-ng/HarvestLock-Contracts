@@ -529,6 +529,19 @@ impl EscrowContract {
     /// to co-sign contract creation itself, only the state transitions
     /// that matter to them (`mark_checkpoint`, `confirm_delivery`).
     ///
+    /// The three party addresses are *not* required to be distinct, on
+    /// purpose. Role separation is enforced where it matters — at each
+    /// state transition, by that role's own `require_auth()` — rather than
+    /// by a distinctness check here. Collapsing buyer, cooperative and
+    /// warehouse onto one principal is a legitimate deployment choice (a
+    /// cooperative that also runs the warehouse, or a minimal single-signer
+    /// validation deployment); `initialize` records the parties it is handed
+    /// and does not second-guess them. The consequence is accepted, not
+    /// hidden: with one principal in all three roles every multi-party
+    /// consent gate reduces to that single signer. See the tests
+    /// `initialize_allows_buyer_cooperative_and_warehouse_to_be_one_address`
+    /// and `all_three_identical_parties_accept_only_that_principals_signature`.
+    ///
     /// `grade_price_bps` must be non-empty, may hold at most
     /// `MAX_GRADE_ENTRIES` entries, and every entry must be ≤ 10_000.
     pub fn initialize(

@@ -1,7 +1,7 @@
 # Rust / Soroban
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed on purpose -- CI builds against it with --locked (issue #91).
 
 # Editors / OS
 .vscode/

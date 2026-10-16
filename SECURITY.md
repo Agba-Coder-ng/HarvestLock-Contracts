@@ -10,7 +10,14 @@ regardless, not through a public issue.
 
 ## Reporting a vulnerability
 
-Email **samuelojetunde898@gmail.com** with:
+Two private channels:
+
+**GitHub private vulnerability reporting** — open the repo's
+[Security tab](https://github.com/Agrisettle/HarvestLock-Contracts/security)
+and use "Report a vulnerability". Lower friction than email, and the
+report stays attached to this repo, visible only to the maintainers.
+
+**Email samuelojetunde898@gmail.com** with:
 
 - Which function in `contracts/escrow/src/lib.rs` is affected
 - Steps to reproduce — ideally a failing `cargo test` case, or a real
@@ -22,9 +29,8 @@ Email **samuelojetunde898@gmail.com** with:
   shortfall/grade adjustment or the advance-tranche accounting are the
   parts with the most arithmetic to get wrong)
 
-There's no dedicated security inbox or bug-bounty program yet — this is
-a two-person team pre-pilot. You'll get a human reply, not an automated
-one.
+There's no bug-bounty program yet — this is a two-person team pre-pilot.
+You'll get a human reply, not an automated one.
 
 **Please don't open a public GitHub issue for a suspected vulnerability**
 until it's been triaged privately first — same policy across every repo

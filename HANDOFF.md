@@ -823,7 +823,32 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 16 Oct 2026 (night) — exact-deadline boundary coverage for all
+*Last updated: 17 Oct 2026 — #63, the Reflector `decimals()` question:
+documented finding plus one test, no contract behavior changed. `oracle_rate()`
+performs *no* conversion math — it returns the raw `price` from `lastprice`
+and never calls the oracle's `decimals()` — so a change to Reflector's
+`decimals()` cannot affect it; the issue's "oracle_rate()'s conversion math"
+is a slight misattribution. The only place `decimals()` enters the math is
+`resolve_fx_shortfall`'s `10i128.pow(decimals)` divisor, read live per
+settlement. The contract's implicit assumption — that `decimals()` is
+immutable — is now verified rather than assumed: Reflector's real contract
+(`oracle/src/settings.rs`) writes `decimals` once in `init`, which aborts with
+`AlreadyInitialized` on a second call, and exposes no `set_decimals`; SEP-40
+states the value "should never change"; Reflector's own integration docs say
+the same. New `docs/reflector-decimals-assumption.md` records the finding in
+full. New test
+`a_plausible_decimals_change_silently_rescales_resolve_fx_shortfall`
+(`tests/oracle_fault_injection.rs`) pins the behavior if the invariant is ever
+violated: a *plausible* new scale (15 vs 14) is accepted with no error and
+silently rescales the conversion by a power of ten, whereas the separate F5
+finding covers an absurd value that *traps* instead. Doc comments in
+`reflector.rs` and `lib.rs` (`OracleConfig`, `resolve_fx_shortfall`) now state
+the assumption instead of leaving it implicit. 156 lib tests unchanged;
+`oracle_fault_injection` 12 → 13 (192 total). No contract code path changed.
+Snapshots for the new test deliberately **not committed** — same record-only
+reasoning as below.
+
+Prior entry: 16 Oct 2026 (night) — exact-deadline boundary coverage for all
 four absolute deadlines (#112–#115): tests only, plus doc-comment corrections,
 no contract behavior changed. Each of `remainder_deadline`,
 `delivery_deadline`, `fx_shortfall_deadline` and `dispute_deadline` now has a

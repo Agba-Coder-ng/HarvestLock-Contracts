@@ -3908,7 +3908,8 @@ fn kitchen_sink_all_optional_features_on_one_commitment() {
     // Set allocation ledger while still in Draft (required before lock)
     let m1 = member(&s.env, 6_000);
     let m2 = member(&s.env, 4_000);
-    s.contract.set_allocation(&Vec::from_array(&s.env, [m1, m2]));
+    s.contract
+        .set_allocation(&Vec::from_array(&s.env, [m1, m2]));
 
     // Lock the commitment (Draft → Locked)
     s.contract.lock();
@@ -3939,7 +3940,8 @@ fn kitchen_sink_all_optional_features_on_one_commitment() {
     s.contract.fund_remainder();
 
     // Confirm full delivery at full price grade (ReadyForDelivery → Delivered)
-    s.contract.confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
+    s.contract
+        .confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
 
     // Resolve FX shortfall (reads fresh oracle rate, computes what buyer owes)
     s.contract.resolve_fx_shortfall();

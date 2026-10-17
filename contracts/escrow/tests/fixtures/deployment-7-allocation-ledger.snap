@@ -1,0 +1,28 @@
+# #125 snapshot: HANDOFF.md Deployment 7 — allocation ledger record + read-back.
+snapshot = deployment-7-allocation-ledger
+provenance = derived from HANDOFF.md "Verified on testnet", Deployment 7, contract
+   CBRZPZPXBYW2QHGU5KOFWG27AS4YM7EQLULOALYAE3VGJ7BMZTZLKARZ: `set_allocation` with
+   two members at a 6000/4000 bps split, `get_allocation` reading the same two
+   entries back, a second `set_allocation` rejected on-chain with Error(Contract,
+   #21) = AllocationAlreadySet, and `lock` then succeeding with the allocation
+   already set. The member hashes here are NOT the deployed ones — the whole point
+   of the salted-hash design is that they are unlinkable, and HANDOFF.md records
+   only the share split, so these 32-byte values are fixture data of the correct
+   shape. No transaction XDR was captured.
+total_amount = 100000000
+advance1_bps = 1500
+advance2_bps = 2000
+claim_window_secs = 604800
+remainder_window_secs = 604800
+delivery_window_secs = 1036800
+contracted_quantity = 1000
+grade_price_bps = 10000,9000,7500
+buyer_mint = 100000000
+
+step = set_allocation a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90:6000 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0:4000 => ok
+check = allocation_count 2
+# recorded on-chain rejection: Error(Contract, #21).
+step = set_allocation a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90:6000 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0:4000 => err(AllocationAlreadySet)
+step = lock => ok
+# recorded: the two features compose — `lock` runs normally with an allocation set.
+check = status Locked

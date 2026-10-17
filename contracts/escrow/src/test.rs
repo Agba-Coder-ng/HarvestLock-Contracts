@@ -158,6 +158,16 @@ fn advance_time(s: &Setup, secs: u64) {
     s.env.ledger().set_timestamp(now + secs);
 }
 
+/// Sets the simulated ledger clock to an absolute timestamp. The
+/// deadline-boundary tests below read the deadline straight out of contract
+/// state and jump to exactly that value: `advance_time`'s `now + secs`
+/// expresses "clearly before" / "clearly after" fine, but re-deriving the
+/// deadline by hand to land on it exactly is the same hand-arithmetic those
+/// tests exist to avoid (and would let a wrong window-length constant hide).
+fn set_time(s: &Setup, timestamp: u64) {
+    s.env.ledger().set_timestamp(timestamp);
+}
+
 /// The deposit-only amount `lock` actually escrows, for a given bps split —
 /// mirrors `EscrowContract::deposit_amount` so tests can assert against it
 /// without reaching into contract internals.
@@ -178,6 +188,18 @@ fn advance_to_remainder_funded(s: &Setup) {
     s.contract.claim_advance_2();
     s.contract.ready_for_delivery();
     s.contract.fund_remainder();
+}
+
+/// The same drive, stopping at `ReadyForDelivery` with the remainder
+/// deliberately left **unfunded** — the state every `remainder_deadline`
+/// boundary assertion starts from.
+fn advance_to_ready_for_delivery(s: &Setup) {
+    s.contract.release_advance_1();
+    s.contract.claim_advance_1();
+    s.contract.mark_checkpoint();
+    s.contract.release_advance_2();
+    s.contract.claim_advance_2();
+    s.contract.ready_for_delivery();
 }
 
 // ---------- basic lifecycle ----------
@@ -207,6 +229,65 @@ fn cannot_initialize_twice() {
         &None,
     );
     assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+/// #94 — `initialize()` deliberately does not require the three named parties
+/// (`buyer`, `cooperative`, `warehouse_operator`) to hold distinct addresses.
+/// Its guard clauses validate the economic parameters and the buyer's
+/// signature; none of them compare the party addresses, so a single principal
+/// holding all three roles initializes successfully and lands in `Draft`.
+///
+/// This is intentional, not an unconsidered gap. Role separation in this
+/// contract is enforced where it matters — at each state transition, by that
+/// role's own `require_auth()` — rather than by a distinctness check at
+/// creation. Collapsing the three roles onto one principal is a deployment
+/// choice (a cooperative that also runs the warehouse, or a minimal test
+/// deployment); the contract records the parties it is handed and does not
+/// second-guess them. The consequence is documented rather than hidden: with
+/// one principal in all three roles, every multi-party consent gate reduces to
+/// that single signer, which the companion auth-model test
+/// `all_three_identical_parties_accept_only_that_principals_signature` pins
+/// down. This test asserts the creation half of that same fact directly.
+#[test]
+fn initialize_allows_buyer_cooperative_and_warehouse_to_be_one_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let one_principal = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token_address, _token, _admin) = create_token(&env, &token_admin);
+
+    let contract_id = env.register(EscrowContract, ());
+    let contract = EscrowContractClient::new(&env, &contract_id);
+
+    let result = contract.try_initialize(
+        &one_principal,
+        &one_principal,
+        &one_principal,
+        &token_address,
+        &1_000_000,
+        &1_000,
+        &1_000,
+        &WINDOW,
+        &REMAINDER_WINDOW,
+        &DELIVERY_WINDOW,
+        &CONTRACTED_QUANTITY,
+        &Vec::from_array(&env, GRADE_PRICE_BPS),
+        &None,
+    );
+    assert_eq!(
+        result,
+        Ok(Ok(())),
+        "initialize must accept the all-identical party shape (no distinctness guard)"
+    );
+    assert_eq!(contract.get_status(), Status::Draft);
+
+    // The three stored roles are the same address the caller passed — the
+    // contract faithfully records the degenerate shape rather than rewriting or
+    // rejecting it.
+    let commitment = contract.get_commitment();
+    assert_eq!(commitment.buyer, one_principal);
+    assert_eq!(commitment.cooperative, one_principal);
+    assert_eq!(commitment.warehouse_operator, one_principal);
 }
 
 #[test]
@@ -1006,6 +1087,45 @@ fn cannot_expire_fx_shortfall_window_before_the_deadline() {
     assert_eq!(result, Err(Ok(Error::FxShortfallWindowNotPassed)));
 }
 
+/// #114 — the exact `fx_shortfall_deadline` boundary.
+///
+/// Same shape as #112's `remainder_deadline`: `fund_fx_shortfall` rejects
+/// only `now > fx_shortfall_deadline` (the deadline second is still the
+/// buyer's window), while `expire_fx_shortfall_window` requires strictly
+/// more than the deadline.
+#[test]
+fn fx_shortfall_deadline_boundary_is_inclusive_for_funding_and_exclusive_for_expiry() {
+    // At exactly the deadline: expiry refused, funding accepted.
+    let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s);
+    s.contract.resolve_fx_shortfall();
+    let deadline = s.contract.get_commitment().fx_shortfall_deadline;
+    assert!(deadline > 0, "a real shortfall must open a deadline");
+    set_time(&s, deadline);
+
+    assert_eq!(
+        s.contract.try_expire_fx_shortfall_window(),
+        Err(Ok(Error::FxShortfallWindowNotPassed))
+    );
+    s.contract.fund_fx_shortfall();
+    assert!(s.contract.get_commitment().fx_shortfall_funded);
+
+    // One second later both halves flip: funding is refused and the very
+    // same expiry call that was refused above now succeeds.
+    let (s2, _oracle2) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s2);
+    s2.contract.resolve_fx_shortfall();
+    let deadline2 = s2.contract.get_commitment().fx_shortfall_deadline;
+    set_time(&s2, deadline2 + 1);
+
+    assert_eq!(
+        s2.contract.try_fund_fx_shortfall(),
+        Err(Ok(Error::FxShortfallWindowPassed))
+    );
+    s2.contract.expire_fx_shortfall_window();
+    assert_eq!(s2.contract.get_status(), Status::Defaulted);
+}
+
 #[test]
 fn cannot_expire_fx_shortfall_window_once_funded() {
     let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
@@ -1353,6 +1473,49 @@ fn cannot_expire_remainder_window_before_deadline() {
     assert_eq!(result, Err(Ok(Error::RemainderWindowNotPassed)));
 }
 
+/// #112 — the exact `remainder_deadline` boundary, at the deadline second
+/// itself and not one second either side of it.
+///
+/// The two guards read in opposite directions on purpose: `fund_remainder`
+/// rejects only `now > remainder_deadline` (inclusive — the deadline second
+/// is still the buyer's to pay in), while `expire_remainder_window` requires
+/// `now > remainder_deadline` (exclusive — the default path is not open in
+/// that second). A payment and a default therefore can never both be legal
+/// at the same timestamp. The clock is set to the deadline read back out of
+/// contract state, not to a value re-derived from `REMAINDER_WINDOW` by hand.
+#[test]
+fn remainder_deadline_boundary_is_inclusive_for_funding_and_exclusive_for_expiry() {
+    // At exactly the deadline: expiry refused, funding accepted.
+    let s = setup(1_500, 2_000);
+    s.contract.lock();
+    advance_to_ready_for_delivery(&s);
+    let deadline = s.contract.get_commitment().remainder_deadline;
+    set_time(&s, deadline);
+
+    assert_eq!(
+        s.contract.try_expire_remainder_window(),
+        Err(Ok(Error::RemainderWindowNotPassed))
+    );
+    s.contract.fund_remainder();
+    assert!(s.contract.get_commitment().remainder_funded);
+
+    // One second later both halves flip: funding is refused and the very
+    // same expiry call that was refused above now succeeds, so the boundary
+    // sits exactly between `deadline` and `deadline + 1`.
+    let s2 = setup(1_500, 2_000);
+    s2.contract.lock();
+    advance_to_ready_for_delivery(&s2);
+    let deadline2 = s2.contract.get_commitment().remainder_deadline;
+    set_time(&s2, deadline2 + 1);
+
+    assert_eq!(
+        s2.contract.try_fund_remainder(),
+        Err(Ok(Error::RemainderWindowPassed))
+    );
+    s2.contract.expire_remainder_window();
+    assert_eq!(s2.contract.get_status(), Status::Defaulted);
+}
+
 #[test]
 fn cannot_expire_remainder_window_if_already_funded() {
     let s = setup(1_500, 2_000);
@@ -1390,6 +1553,52 @@ fn expire_remainder_window_is_permissionless() {
 
     s.contract.expire_remainder_window();
     assert_eq!(s.contract.get_status(), Status::Defaulted);
+}
+
+#[test]
+fn expire_remainder_window_works_when_only_a_third_party_signs() {
+    // Issue #73: "called by a genuinely unrelated third-party address
+    // (confirm it's still permissionless, not accidentally gated)". The
+    // test above runs under mock_all_auths(), which satisfies any
+    // require_auth() a future accidental gate would add — it cannot tell
+    // "permissionless" from "every party's auth silently provided".
+    // mock_auths(&[stranger]) can: every require_auth() except the
+    // stranger's own exact invocation would fail, so this call succeeding
+    // proves the path requires no signature at all — the stranger's entry
+    // is never even consumed. The tranches are deliberately left
+    // unclaimed, so the sweep has a non-zero balance to move and the
+    // assertions cover the actual transfer, not just the status flip.
+    let s = setup(1_500, 2_000);
+    s.contract.lock();
+    s.contract.release_advance_1();
+    s.contract.mark_checkpoint();
+    s.contract.release_advance_2();
+    s.contract.ready_for_delivery();
+    advance_time(&s, REMAINDER_WINDOW + 1);
+
+    let stranger = Address::generate(&s.env);
+    let invoke = mock_invoke(
+        &s.contract.address,
+        "expire_remainder_window",
+        ().into_val(&s.env),
+    );
+    s.env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &invoke,
+    }]);
+
+    let contract_balance_before = s.token.balance(&s.contract.address);
+    let cooperative_balance_before = s.token.balance(&s.cooperative);
+    assert!(contract_balance_before > 0); // the unclaimed deposit
+
+    s.contract.expire_remainder_window();
+
+    assert_eq!(s.contract.get_status(), Status::Defaulted);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(
+        s.token.balance(&s.cooperative),
+        cooperative_balance_before + contract_balance_before
+    );
 }
 
 // ---------- reclaim_on_nondelivery (seller-non-delivery forfeiture) ----------
@@ -1452,6 +1661,33 @@ fn cannot_reclaim_on_nondelivery_before_deadline() {
     assert_eq!(result, Err(Ok(Error::DeliveryDeadlineNotPassed)));
 }
 
+/// #113 — the exact `delivery_deadline` boundary.
+///
+/// `reclaim_on_nondelivery`'s guard is `now <= delivery_deadline`, so the
+/// deadline second itself still belongs to the cooperative: the buyer's
+/// forfeiture right opens strictly after it.
+#[test]
+fn delivery_deadline_boundary_is_exclusive_for_reclaim_on_nondelivery() {
+    let s = setup(1_500, 2_000);
+    s.contract.lock();
+    let deadline = s.contract.get_commitment().delivery_deadline;
+    set_time(&s, deadline);
+
+    assert_eq!(
+        s.contract.try_reclaim_on_nondelivery(),
+        Err(Ok(Error::DeliveryDeadlineNotPassed))
+    );
+    // Refused, and nothing moved: the call is all-or-nothing at the boundary.
+    assert_eq!(s.contract.get_status(), Status::Locked);
+    assert!(s.token.balance(&s.contract.address) > 0);
+
+    // One second later it opens — proving the refusal above is the boundary
+    // itself, not a wider margin.
+    set_time(&s, deadline + 1);
+    s.contract.reclaim_on_nondelivery();
+    assert_eq!(s.contract.get_status(), Status::Forfeited);
+}
+
 #[test]
 fn cannot_reclaim_on_nondelivery_from_draft() {
     let s = setup(1_500, 2_000);
@@ -1482,6 +1718,59 @@ fn reclaim_on_nondelivery_requires_buyer_auth() {
     s.contract.reclaim_on_nondelivery();
     let auths = s.env.auths();
     assert!(auths.iter().any(|(addr, _)| *addr == s.buyer));
+}
+
+#[test]
+fn reclaim_on_nondelivery_attempted_by_a_non_buyer_fails() {
+    // Issue #72: the same call "attempted by someone other than the
+    // buyer". The test above runs under mock_all_auths(), which can show
+    // the buyer's require_auth() is reached, never that anyone else's
+    // signature is insufficient. Under mock_auths(&[stranger]) the
+    // stranger's entry is the only one in the authorization set, so
+    // c.buyer.require_auth() matches nothing: the call must abort as a
+    // host auth error and leave no partial state. The buyer's own entry
+    // then succeeds from that exact same state, proving the gate is
+    // precisely "the buyer's signature" — not some other condition that
+    // would also have stopped the buyer.
+    let s = setup(1_500, 2_000);
+    s.contract.lock();
+    advance_time(&s, DELIVERY_WINDOW + 1);
+
+    let stranger = Address::generate(&s.env);
+    let buyer_balance_before = s.token.balance(&s.buyer);
+    let contract_balance_before = s.token.balance(&s.contract.address);
+
+    let invoke = mock_invoke(
+        &s.contract.address,
+        "reclaim_on_nondelivery",
+        ().into_val(&s.env),
+    );
+    s.env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &invoke,
+    }]);
+    let result = s.contract.try_reclaim_on_nondelivery();
+    assert!(
+        matches!(result, Err(Err(_))),
+        "a non-buyer's signature must not reclaim: {result:?}"
+    );
+    // Atomicity: the rejected invocation rolled back every write.
+    assert_eq!(s.contract.get_status(), Status::Locked);
+    assert_eq!(
+        s.token.balance(&s.contract.address),
+        contract_balance_before
+    );
+    assert_eq!(s.token.balance(&s.buyer), buyer_balance_before);
+
+    // Same call, the one signature it actually requires.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.buyer,
+        invoke: &invoke,
+    }]);
+    s.contract.reclaim_on_nondelivery();
+    assert_eq!(s.contract.get_status(), Status::Forfeited);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(s.token.balance(&s.buyer), s.total_amount);
 }
 
 // ---------- confirm_delivery now gated on remainder funded ----------
@@ -2345,6 +2634,47 @@ fn expire_dispute_window_rejects_before_the_deadline() {
     assert_eq!(result, Err(Ok(Error::DisputeWindowNotPassed)));
 }
 
+/// #115 — the exact `dispute_deadline` boundary.
+///
+/// `expire_dispute_window`'s guard is `now <= dispute_deadline`, so the
+/// deadline second itself is still inside the freeze. `resolve_dispute` has
+/// no deadline guard at all — unanimous consent is its only gate — so it
+/// still succeeds in that same second. That pairing is what keeps the
+/// boundary second from being a dead zone where neither resume path works.
+#[test]
+fn dispute_deadline_boundary_keeps_resolve_open_and_expire_closed() {
+    // At exactly the deadline: timeout refused, unanimous resolve accepted.
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.flag_dispute(&s.buyer);
+    let deadline = s.contract.get_commitment().dispute_deadline;
+    assert!(deadline > 0, "flagging a dispute must open a deadline");
+    set_time(&s, deadline);
+
+    assert_eq!(
+        s.contract.try_expire_dispute_window(),
+        Err(Ok(Error::DisputeWindowNotPassed))
+    );
+    assert_eq!(s.contract.get_status(), Status::Disputed);
+    s.contract.resolve_dispute();
+    assert_eq!(s.contract.get_status(), Status::Locked);
+
+    // One second later the timeout path opens too, restoring the same
+    // pre-dispute status.
+    let s2 = setup(1_500, 1_500);
+    s2.contract.lock();
+    s2.contract.flag_dispute(&s2.buyer);
+    let deadline2 = s2.contract.get_commitment().dispute_deadline;
+    set_time(&s2, deadline2 + 1);
+
+    s2.contract.expire_dispute_window();
+    assert_eq!(s2.contract.get_status(), Status::Locked);
+    assert_eq!(
+        s2.contract.get_commitment().dispute_pre_status,
+        Status::Draft
+    );
+}
+
 #[test]
 fn expire_dispute_window_restores_pre_dispute_status_after_the_deadline() {
     let s = setup(1_500, 1_500);
@@ -2404,6 +2734,98 @@ fn dispute_does_not_pause_an_already_ticking_deadline_known_limitation() {
     let deposit = deposit_amount(s.total_amount, 1_500, 1_500);
     let advance1_amount = s.total_amount * 1_500 / 10_000;
     assert_eq!(s.token.balance(&s.buyer), s.total_amount - deposit + advance1_amount);
+}
+
+#[test]
+fn dispute_in_the_remainder_window_the_remainder_deadline_still_governs() {
+    // Issue #75, the `remainder_deadline` half: extends the known-limitation
+    // test above from the advance-1 claim window to `expire_remainder_window`'s
+    // own deadline. The dispute is flagged with one second left on the
+    // remainder window, so that deadline expires mid-freeze while the
+    // dispute's own (equally long) window is still open. Which deadline
+    // governs: the remainder deadline. The freeze controls who can act —
+    // status-gated calls bounce for as long as it lasts — but it never
+    // pauses, extends, or resets the deadline itself, so once the dispute
+    // resolves, curing is already impossible and the expired deadline's
+    // consequence is immediately available.
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.release_advance_1();
+    s.contract.mark_checkpoint();
+    s.contract.release_advance_2();
+    s.contract.ready_for_delivery();
+
+    advance_time(&s, REMAINDER_WINDOW - 1);
+    s.contract.flag_dispute(&s.buyer);
+    advance_time(&s, 2); // past remainder_deadline (604_800), still inside dispute_deadline (1_209_599)
+
+    // The dispute is genuinely still open — it's the other deadline that
+    // expired.
+    let result = s.contract.try_expire_dispute_window();
+    assert_eq!(result, Err(Ok(Error::DisputeWindowNotPassed)));
+
+    // While frozen, the past-due remainder deadline changes nothing: the
+    // status gate bounces the call.
+    let result = s.contract.try_expire_remainder_window();
+    assert_eq!(result, Err(Ok(Error::InvalidState)));
+
+    // The parties resolve — status restores to exactly the pre-dispute
+    // ReadyForDelivery ...
+    s.contract.resolve_dispute();
+    assert_eq!(s.contract.get_status(), Status::ReadyForDelivery);
+
+    // ... but the remainder deadline governs from here: the freeze didn't
+    // extend it, so the buyer can no longer cure by funding ...
+    let result = s.contract.try_fund_remainder();
+    assert_eq!(result, Err(Ok(Error::RemainderWindowPassed)));
+
+    // ... and the expired deadline's own consequence executes immediately.
+    let deposit = deposit_amount(s.total_amount, 1_500, 1_500);
+    s.contract.expire_remainder_window();
+    assert_eq!(s.contract.get_status(), Status::Defaulted);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(s.token.balance(&s.cooperative), deposit);
+}
+
+#[test]
+fn dispute_in_the_fx_shortfall_window_the_fx_shortfall_deadline_still_governs() {
+    // Issue #75, the `fx_shortfall_deadline` half: same shape as the
+    // remainder-window test above, on the window `resolve_fx_shortfall`
+    // opens once a genuine shortfall exists. The top-up deadline expires
+    // mid-freeze; the shortfall deadline still governs.
+    let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s);
+    s.contract.resolve_fx_shortfall();
+
+    advance_time(&s, REMAINDER_WINDOW - 1);
+    s.contract.flag_dispute(&s.buyer);
+    advance_time(&s, 2); // past fx_shortfall_deadline, still inside dispute_deadline
+
+    let result = s.contract.try_expire_dispute_window();
+    assert_eq!(result, Err(Ok(Error::DisputeWindowNotPassed)));
+
+    // While frozen, the past-due FX deadline changes nothing.
+    let result = s.contract.try_expire_fx_shortfall_window();
+    assert_eq!(result, Err(Ok(Error::InvalidState)));
+
+    s.contract.resolve_dispute();
+    assert_eq!(s.contract.get_status(), Status::Delivered);
+
+    // The deadline governs: the top-up can no longer be paid in ...
+    let result = s.contract.try_fund_fx_shortfall();
+    assert_eq!(result, Err(Ok(Error::FxShortfallWindowPassed)));
+
+    // ... and its consequence executes immediately: the escrowed remainder
+    // sweeps to the cooperative, Defaulted.
+    let escrow_before = s.token.balance(&s.contract.address); // the 700_000 funded remainder
+    let cooperative_before = s.token.balance(&s.cooperative); // the claimed 300_000
+    s.contract.expire_fx_shortfall_window();
+    assert_eq!(s.contract.get_status(), Status::Defaulted);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(
+        s.token.balance(&s.cooperative),
+        cooperative_before + escrow_before
+    );
 }
 
 // ---------- multi-party Soroban auth model scrutiny (#138-#141) ----------
@@ -3106,215 +3528,228 @@ fn initialize_is_not_a_transition_and_publishes_nothing() {
     assert_no_transition(&s);
 }
 
-// ---------- composition: feature pairs that fall between happy paths ----------
+// ---------- composition tests (#103-#106) ----------
 //
-// The tests below each combine two independently well-tested
-// features into one scenario, targeting the class of bug that lives in
-// the seam between them rather than inside either one.
+// Each test below pairs two features that are each well covered on their own
+// happy path and checks the interaction between them — the cases that fall
+// between the two suites, where neither feature exercises the other already
+// being in flight.
 
+/// #103 — `reassign_buyer` rewrites only the commitment's `buyer` field. The
+/// allocation ledger lives under its own `DataKey::Allocation` instance entry
+/// and describes the cooperative's members, not who holds the buyer's
+/// position, so a novation must leave it exactly as recorded — and must not
+/// fail because of it either.
 #[test]
-fn dispute_exit_never_requires_an_oracle_read_so_a_stale_quote_cannot_deadlock_it() {
-    // Issue #107. `oracle_rate` enforces a staleness bound and
-    // `flag_dispute` freezes the commitment — two features with their own
-    // happy-path coverage. The interaction to prove: a dispute flagged
-    // while the oracle quote is going stale must not be able to trap the
-    // commitment, which would happen if dispute *exit* depended on an
-    // oracle read that's now permanently stale with no way to refresh it
-    // before another deadline forces a resolution.
-    //
-    // It can't, by construction: neither `resolve_dispute` nor
-    // `expire_dispute_window` reads the oracle at all — each only
-    // restores `dispute_pre_status`. This proves that rather than
-    // assuming it.
-    let (s, oracle) = setup_with_oracle(3_600);
+fn reassign_buyer_leaves_a_recorded_allocation_ledger_completely_untouched() {
+    let s = setup(1_500, 1_500);
+    let members = Vec::from_array(&s.env, [member(&s.env, 6_000), member(&s.env, 4_000)]);
+    s.contract.set_allocation(&members);
     s.contract.lock();
-    s.contract.flag_dispute(&s.buyer);
-
-    // Let the configured staleness bound lapse while the dispute is open.
-    advance_time(&s, 3_601);
-
-    // The oracle read is still *available* (never status-blocked) — it
-    // simply reports staleness, which is correct permissionless-read
-    // behavior, not a deadlock.
-    assert_eq!(s.contract.try_oracle_rate(), Err(Ok(Error::OracleStale)));
-
-    // Unanimous resolution succeeds *despite* the stale quote, because it
-    // needs no oracle read at all.
-    s.contract.resolve_dispute();
-    assert_eq!(s.contract.get_status(), Status::Locked);
-
-    // The stale window was never a permanent block on anything: refresh
-    // the oracle and the read is accepted again, and the deal resumes.
-    oracle.set_price(&176_000_000_000_000i128, &s.env.ledger().timestamp());
-    assert_eq!(s.contract.oracle_rate().price, 176_000_000_000_000);
+    let recorded = s.contract.get_allocation();
     s.contract.release_advance_1();
-    assert_eq!(s.contract.get_status(), Status::Advance1Released);
+
+    let new_buyer = Address::generate(&s.env);
+    s.contract.reassign_buyer(&new_buyer);
+
+    // Byte-for-byte the same ledger: same entries, same order, same hashes and
+    // same shares. Nothing was copied, re-keyed, or cleared.
+    let after = s.contract.get_allocation();
+    assert_eq!(after, recorded);
+    assert_eq!(after.len(), 2);
+    assert_eq!(after.get(0).unwrap(), recorded.get(0).unwrap());
+    assert_eq!(after.get(1).unwrap(), recorded.get(1).unwrap());
+
+    // Only `buyer` moved, and the new holder genuinely owns the position's
+    // buyer-only rights — the reassignment really landed, while the ledger sat
+    // untouched beside it.
+    assert_eq!(s.contract.get_commitment().buyer, new_buyer);
+    advance_time(&s, WINDOW + 1);
+    s.contract.reclaim_advance_1();
+    let advance1_amount = s.total_amount * 1_500 / 10_000;
+    assert_eq!(s.token.balance(&new_buyer), advance1_amount);
+    assert_eq!(s.contract.get_allocation(), recorded);
 }
 
+/// #104 — `flag_dispute` from `Delivered` while the FX-shortfall funding window
+/// is still open. The freeze blocks `settle` and the shortfall calls
+/// themselves (all status-gated), but per `flag_dispute`'s documented
+/// limitation it does *not* pause `fx_shortfall_deadline`: that deadline keeps
+/// running on absolute time, so a dispute outliving it lands on the default
+/// path instead of buying the buyer a free extension.
 #[test]
-fn permissionless_dispute_escape_also_works_while_the_oracle_is_stale() {
-    // The other exit path — `expire_dispute_window`, permissionless once
-    // the dispute deadline passes — likewise touches no oracle, so a
-    // stale quote can't block it either. Covers the "one party refuses to
-    // ever consent" branch the unanimous `resolve_dispute` path doesn't:
-    // even with no cooperation and a permanently stale oracle, the freeze
-    // is still escapable, so it can never become permanent.
-    let (s, _oracle) = setup_with_oracle(3_600);
-    s.contract.lock();
-    s.contract.flag_dispute(&s.buyer);
-
-    // Push past both the staleness bound and the dispute deadline
-    // (`flag_dispute` set the latter to remainder_window_secs out).
-    advance_time(&s, REMAINDER_WINDOW + 1);
-    assert_eq!(s.contract.try_oracle_rate(), Err(Ok(Error::OracleStale)));
-
-    s.contract.expire_dispute_window();
-    assert_eq!(s.contract.get_status(), Status::Locked);
-}
-
-#[test]
-fn set_allocation_is_rejected_during_a_dispute_and_the_two_never_coexist() {
-    // Issue #108. `set_allocation` is documented Draft-only, and
-    // `flag_dispute` is reachable from Locked through Delivered — never
-    // from Draft — so "a dispute is open" already implies the commitment
-    // has left Draft. The interaction is unreachable-by-construction as a
-    // *success*, and must reject with `InvalidState` (the Draft gate)
-    // rather than any allocation-specific error. Proves that instead of
-    // leaving it an assumption.
-    let s = setup(1_500, 1_500);
-    let members = Vec::from_array(&s.env, [member(&s.env, 10_000)]);
-
-    // No state is ever simultaneously Draft (where set_allocation is
-    // legal) and Disputed, because a dispute can't be flagged from Draft.
-    assert_eq!(
-        s.contract.try_flag_dispute(&s.buyer),
-        Err(Ok(Error::InvalidState))
-    );
-
-    // Reach a genuinely Disputed status...
-    s.contract.lock();
-    s.contract.flag_dispute(&s.buyer);
-    assert_eq!(s.contract.get_status(), Status::Disputed);
-
-    // ...where set_allocation is rejected purely on the Draft gate —
-    // never `AllocationAlreadySet` (nothing was ever recorded) and never
-    // success.
-    assert_eq!(
-        s.contract.try_set_allocation(&members),
-        Err(Ok(Error::InvalidState))
-    );
-
-    // Still rejected after resolving: the status is now Locked, also not
-    // Draft, confirming set_allocation and an ever-opened dispute can
-    // never line up.
-    s.contract.resolve_dispute();
-    assert_eq!(
-        s.contract.try_set_allocation(&members),
-        Err(Ok(Error::InvalidState))
-    );
-}
-
-#[test]
-fn mark_checkpoint_and_confirm_delivery_are_both_frozen_by_an_open_dispute() {
-    // Issue #109. The delivery-pipeline pair — `mark_checkpoint` (needs
-    // Advance1Released) and `confirm_delivery` (needs ReadyForDelivery) —
-    // each has a required status that is a legal `flag_dispute` source,
-    // so a dispute can be opened from exactly the state each would
-    // otherwise advance from. This proves that specific pair is blocked
-    // with an explicit test rather than leaning on the general "no call
-    // accepts Disputed" pattern by inspection, and that the freeze lifts
-    // cleanly once resolved.
-
-    // -- mark_checkpoint half --
-    let s = setup(1_500, 1_500);
-    s.contract.lock();
-    s.contract.release_advance_1();
-    assert_eq!(s.contract.get_status(), Status::Advance1Released); // legal here
-    s.contract.flag_dispute(&s.cooperative);
-    assert_eq!(
-        s.contract.try_mark_checkpoint(),
-        Err(Ok(Error::InvalidState))
-    );
-    // Resolve back to Advance1Released, then the real call succeeds — a
-    // genuine subsequent call proves the freeze lifted, not just the
-    // status field flipping.
-    s.contract.resolve_dispute();
-    s.contract.mark_checkpoint();
-    assert_eq!(s.contract.get_status(), Status::CheckpointPassed);
-
-    // -- confirm_delivery half --
-    let s = setup(1_500, 1_500);
-    s.contract.lock();
-    advance_to_remainder_funded(&s);
-    assert_eq!(s.contract.get_status(), Status::ReadyForDelivery); // legal here
-    s.contract.flag_dispute(&s.warehouse);
-    assert_eq!(
-        s.contract
-            .try_confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE),
-        Err(Ok(Error::InvalidState))
-    );
-    s.contract.resolve_dispute();
-    s.contract
-        .confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
-    assert_eq!(s.contract.get_status(), Status::Delivered);
-}
-
-#[test]
-fn expire_fx_shortfall_window_and_a_same_ledger_dispute_stay_consistent_in_either_order() {
-    // Issue #110. `expire_fx_shortfall_window` is permissionless and a
-    // dispute can be flagged from Delivered — both could plausibly be
-    // submitted against the same Delivered commitment in the same ledger
-    // close. Soroban orders transactions within a ledger into one total
-    // order, so exactly one runs first; the property to prove is that the
-    // contract ends consistent whichever does, with the escrow swept
-    // exactly once — never twice, never zero times leaving an unfunded
-    // shortfall frozen indefinitely.
-
-    // Order A: expire_fx_shortfall_window lands first.
+fn flag_dispute_during_an_open_fx_shortfall_window_freezes_settle_without_disturbing_the_deadline() {
     let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
     advance_to_delivered_with_shortfall(&s);
     s.contract.resolve_fx_shortfall();
-    advance_time(&s, REMAINDER_WINDOW + 1); // fx_shortfall_deadline passes
-    let coop_before = s.token.balance(&s.cooperative);
-    let contract_held = s.token.balance(&s.contract.address);
 
-    s.contract.expire_fx_shortfall_window(); // Delivered -> Defaulted, sweep
+    let before = s.contract.get_commitment();
+    assert_eq!(before.fx_shortfall_amount, EXPECTED_SHORTFALL);
+    assert!(!before.fx_shortfall_funded);
+    let shortfall_deadline = before.fx_shortfall_deadline;
+    assert!(
+        shortfall_deadline > s.env.ledger().timestamp(),
+        "precondition: the shortfall funding window is still open"
+    );
 
-    assert_eq!(s.contract.get_status(), Status::Defaulted);
-    // The dispute flag that "lost the race" is now cleanly rejected:
-    // Defaulted is terminal and never a flag_dispute source.
+    s.contract.flag_dispute(&s.buyer);
+    assert_eq!(s.contract.get_status(), Status::Disputed);
+
+    // Everything the open window would otherwise allow is frozen — by the
+    // status gate, before any of the window's own guards get a chance to speak.
+    assert_eq!(s.contract.try_settle(), Err(Ok(Error::InvalidState)));
     assert_eq!(
-        s.contract.try_flag_dispute(&s.buyer),
+        s.contract.try_fund_fx_shortfall(),
         Err(Ok(Error::InvalidState))
     );
-    // Swept exactly once.
-    assert_eq!(s.token.balance(&s.contract.address), 0);
-    assert_eq!(s.token.balance(&s.cooperative), coop_before + contract_held);
-
-    // Order B: flag_dispute lands first.
-    let (s, _oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
-    advance_to_delivered_with_shortfall(&s);
-    s.contract.resolve_fx_shortfall();
-    advance_time(&s, REMAINDER_WINDOW + 1);
-    s.contract.flag_dispute(&s.cooperative); // Delivered -> Disputed(pre=Delivered)
-
-    assert_eq!(s.contract.get_status(), Status::Disputed);
-    // expire_fx_shortfall_window now sees a non-Delivered status and
-    // refuses — no sweep, no default, while the freeze holds.
     assert_eq!(
         s.contract.try_expire_fx_shortfall_window(),
         Err(Ok(Error::InvalidState))
     );
-    assert!(s.token.balance(&s.contract.address) > 0); // escrow untouched
 
-    // Resolving restores Delivered exactly, at which point the sweep runs
-    // and produces the identical terminal outcome as Order A.
-    s.contract.resolve_dispute();
+    // …but only `status` was frozen. The shortfall's own deadline and amount
+    // are exactly as they were: nothing extended, no clock reset.
+    let frozen = s.contract.get_commitment();
+    assert_eq!(frozen.fx_shortfall_deadline, shortfall_deadline);
+    assert_eq!(frozen.fx_shortfall_amount, EXPECTED_SHORTFALL);
+    assert!(!frozen.fx_shortfall_funded);
+    assert_eq!(frozen.dispute_pre_status, Status::Delivered);
+
+    // Let the dispute lapse *after* the shortfall deadline passed.
+    advance_time(&s, REMAINDER_WINDOW + 1);
+    s.contract.expire_dispute_window();
     assert_eq!(s.contract.get_status(), Status::Delivered);
-    let coop_before = s.token.balance(&s.cooperative);
-    let contract_held = s.token.balance(&s.contract.address);
+
+    // Curing the shortfall is now too late: the deadline kept running through
+    // the freeze, which is the limitation, checked for this specific pair.
+    assert_eq!(
+        s.contract.try_fund_fx_shortfall(),
+        Err(Ok(Error::FxShortfallWindowPassed))
+    );
+
+    // And the consequence that deadline was always gating is reachable: the
+    // escrow sweeps to the cooperative and the buyer defaults.
     s.contract.expire_fx_shortfall_window();
     assert_eq!(s.contract.get_status(), Status::Defaulted);
     assert_eq!(s.token.balance(&s.contract.address), 0);
-    assert_eq!(s.token.balance(&s.cooperative), coop_before + contract_held);
+    // Deposit + remainder escrowed (1_000_000) less the 300_000 the
+    // cooperative already claimed across the two tranches.
+    assert_eq!(s.token.balance(&s.cooperative), 1_000_000);
+}
+
+/// #105 — `cancel` after an allocation has been recorded. `cancel` unwinds the
+/// *commitment* — its status and whatever balance is escrowed — and knows
+/// nothing about `DataKey::Allocation`; cleaning that up is not its job. The
+/// recorded hashes therefore outlive the deal they described and simply become
+/// meaningless: still on-chain, still unlinkable from people (the salts live
+/// off-chain), and permanently orphaned — not an error, and not a reason for
+/// `cancel` to fail.
+#[test]
+fn cancel_after_an_allocation_is_recorded_leaves_the_ledger_orphaned_not_an_error() {
+    let s = setup(1_500, 1_500);
+    let members = Vec::from_array(&s.env, [member(&s.env, 6_000), member(&s.env, 4_000)]);
+    s.contract.set_allocation(&members);
+    s.contract.lock();
+    let recorded = s.contract.get_allocation();
+
+    // Cancel with an escrowed deposit and an allocation already on record.
+    s.contract.cancel();
+
+    // The unwind succeeded as if no allocation existed at all — it was never
+    // consulted, so it could not block or alter the cancellation.
+    assert_eq!(s.contract.get_status(), Status::Cancelled);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+    assert_eq!(s.token.balance(&s.buyer), s.total_amount);
+    assert_eq!(s.token.balance(&s.cooperative), 0);
+
+    // The entry survived untouched: `get_allocation` still answers with the
+    // same ledger even though the commitment it belonged to is dead.
+    let after = s.contract.get_allocation();
+    assert_eq!(after, recorded);
+    assert_eq!(after.len(), 2);
+    assert_eq!(after.get(0).unwrap(), recorded.get(0).unwrap());
+
+    // And it was not swept away as part of the unwind — there is no cleanup
+    // path for it, so the orphan is permanent. Read through the contract's own
+    // storage context, since the entry is instance-scoped to it.
+    let still_recorded = s.env.as_contract(&s.contract.address, || {
+        s.env.storage().instance().has(&DataKey::Allocation)
+    });
+    assert!(still_recorded);
+
+    // A second `set_allocation` still rejects, but with `InvalidState`: the
+    // terminal status is checked first, so the allocation guard is never even
+    // reached. The ledger is unreachable-by-writing as well as meaningless.
+    let other = Vec::from_array(&s.env, [member(&s.env, 10_000)]);
+    assert_eq!(
+        s.contract.try_set_allocation(&other),
+        Err(Ok(Error::InvalidState))
+    );
+    // Cancellation is terminal on its own account, not because of the ledger.
+    assert_eq!(s.contract.try_cancel(), Err(Ok(Error::InvalidState)));
+    assert_eq!(s.contract.try_lock(), Err(Ok(Error::InvalidState)));
+}
+
+/// #106 — `resolve_dispute` restoring the hardest pre-dispute status:
+/// `ReadyForDelivery`, i.e. mid-way through the two-phase-funding window with
+/// the remainder still unfunded. The freeze lands on top of a clock only the
+/// buyer can satisfy, so restoring must bring back that exact window state —
+/// same absolute deadline, still unfunded — not just a plausible-looking
+/// status. The simpler earlier states have their own coverage; this is the one
+/// where a restored-but-broken window would silently cost the cooperative the
+/// deal.
+#[test]
+fn resolve_dispute_restores_a_ready_for_delivery_commitment_still_inside_its_funding_window() {
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    s.contract.release_advance_1();
+    s.contract.claim_advance_1();
+    s.contract.mark_checkpoint();
+    s.contract.release_advance_2();
+    s.contract.claim_advance_2();
+    s.contract.ready_for_delivery();
+
+    let mid_window = s.contract.get_commitment();
+    assert_eq!(mid_window.status, Status::ReadyForDelivery);
+    assert!(!mid_window.remainder_funded);
+    let remainder_deadline = mid_window.remainder_deadline;
+    assert!(
+        remainder_deadline > s.env.ledger().timestamp(),
+        "precondition: the remainder funding window is still open"
+    );
+
+    // Freeze it while the buyer's outstanding funding obligation is live.
+    s.contract.flag_dispute(&s.warehouse);
+    assert_eq!(s.contract.get_status(), Status::Disputed);
+    assert_eq!(
+        s.contract.try_fund_remainder(),
+        Err(Ok(Error::InvalidState))
+    );
+
+    // Unanimous resolution restores the precise mid-window state.
+    s.contract.resolve_dispute();
+    let restored = s.contract.get_commitment();
+    assert_eq!(restored.status, Status::ReadyForDelivery);
+    assert_eq!(restored.dispute_pre_status, Status::Draft);
+    assert_eq!(restored.dispute_deadline, 0);
+    // Same absolute deadline — the dispute neither paused nor extended it…
+    assert_eq!(restored.remainder_deadline, remainder_deadline);
+    // …and the funding flag survived the round trip as still-unfunded.
+    assert!(!restored.remainder_funded);
+
+    // The restored state is live, not merely displayable: the buyer can still
+    // meet the obligation inside the window it always had, and the deal then
+    // runs to settlement as it would have without the dispute.
+    s.contract.fund_remainder();
+    assert!(s.contract.get_commitment().remainder_funded);
+
+    s.contract.confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
+    s.contract.settle();
+    assert_eq!(s.contract.get_status(), Status::Settled);
+
+    // Both tranches (300_000) plus the remainder (700_000) all land with the
+    // cooperative at full delivery and full grade; nothing is stranded.
+    assert_eq!(s.token.balance(&s.cooperative), s.total_amount);
+    assert_eq!(s.token.balance(&s.buyer), 0);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
 }

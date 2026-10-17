@@ -23,6 +23,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check Rust formatting
+        run: cargo fmt --check --manifest-path contracts/escrow/Cargo.toml
+
       - name: Cache cargo
         uses: actions/cache@v6
         with:
@@ -34,9 +37,126 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # --locked: fail rather than silently re-resolve if Cargo.lock is out
+      # of sync with Cargo.toml -- a dependency must never float between a
+      # local build and CI's build (issue #91).
       - name: cargo test
         working-directory: contracts/escrow
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
+
+  # ---------------------------------------------------------------------
+  # #111, #122, #124, #125 — four integration suites, each its own job so
+  # a failure points at the issue it guards instead of at "cargo test".
+  # They are separate `--test` targets under contracts/escrow/tests/, so
+  # the umbrella `test` job above also runs them; these jobs exist so the
+  # signal is legible per issue and so a suite can be re-run alone.
+  # ---------------------------------------------------------------------
+
+  deadline-boundary:
+    name: "#111 deadline boundary tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Exact-boundary coverage for advance1_deadline/advance2_deadline against
+      # claim (inclusive at the deadline) and reclaim (exclusive).
+      - name: cargo test --test deadline_boundary
+        working-directory: contracts/escrow
+        run: cargo test --test deadline_boundary --verbose
+
+  address-equality:
+    name: "#122 Address equality audit"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Every Address-vs-Address comparison in the contract compared by value,
+      # plus a source-level guard against stringified identity comparisons.
+      - name: cargo test --test address_equality
+        working-directory: contracts/escrow
+        run: cargo test --test address_equality --verbose
+
+  oracle-fault-injection:
+    name: "#124 Reflector oracle fault injection"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Unreachable / panicking / garbage-returning / stale oracle against the
+      # documented OracleNotConfigured / OraclePriceUnavailable / OracleStale
+      # degradation paths.
+      - name: cargo test --test oracle_fault_injection
+        working-directory: contracts/escrow
+        run: cargo test --test oracle_fault_injection --verbose
+
+  snapshot-replay:
+    name: "#125 deployment snapshot replay"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Replays the transcripts under contracts/escrow/tests/fixtures/ against
+      # the current build. Green plus a printed divergence report; an
+      # undeclared divergence fails. See fixtures/README.md.
+      - name: cargo test --test snapshot_replay
+        working-directory: contracts/escrow
+        run: cargo test --test snapshot_replay -- --nocapture
 
   build-wasm:
     name: stellar contract build
@@ -74,9 +194,11 @@ jobs:
       - name: Install Stellar CLI
         run: cargo install --locked stellar-cli
 
+      # --locked: same reasoning as the test job above -- the wasm must be
+      # built from the same pinned dependency set the rest of CI uses.
       - name: stellar contract build
         working-directory: .
-        run: stellar contract build
+        run: stellar contract build --locked
 
   # Regression safety nets one layer up from `cargo test`: both guard a
   # class of problem no single hand-written test is positioned to catch
@@ -104,3 +226,52 @@ jobs:
       # one entirely.
       - name: Guard public method auth doc comments
         run: bash .github/scripts/check_auth_docs.sh
+
+  # Differential testing across Soroban SDK minor versions
+  sdk-differential-test:
+    name: Differential SDK Version Testing
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        soroban-version: [28.0.0, 29.0.1]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.soroban-version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.soroban-version }}-
+
+      - name: Update soroban-sdk version
+        run: |
+          cd contracts/escrow
+          # Update both dependencies and dev-dependencies
+          sed -i 's/soroban-sdk = "[^"]*"/soroban-sdk = "${{ matrix.soroban-version }}"/' Cargo.toml
+          sed -i 's/soroban-sdk = { version = "[^"]*"',/soroban-sdk = { version = "${{ matrix.soroban-version }}",/' Cargo.toml
+
+      - name: Verify updated version
+        working-directory: contracts/escrow
+        run: |
+          echo "Updated Cargo.toml:"
+          grep -A2 -B2 "soroban-sdk" Cargo.toml
+
+      - name: cargo test
+        working-directory: contracts/escrow
+        run: cargo test --verbose
+
+      # Revert Cargo.toml changes to avoid polluting the repository
+      # (this job runs on a copy, so technically not needed, but good practice)
+      - name: Revert Cargo.toml changes
+        if: always()
+        run: |
+          cd contracts/escrow
+          git checkout Cargo.toml

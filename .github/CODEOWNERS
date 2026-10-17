@@ -1,0 +1,4 @@
+# Route every change under contracts/ to the maintainer: the escrow
+# contract is the project's highest-stakes code, and its review shouldn't
+# depend on someone happening to notice the PR (issue #85).
+/contracts/ @samjay8

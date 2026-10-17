@@ -35,6 +35,17 @@
 //! full reasoning and its one known limitation (other deadlines on the
 //! commitment don't pause while a dispute is open).
 //!
+//! All absolute deadlines here follow one boundary rule: the recorded
+//! deadline timestamp is the *last* second on which the original window
+//! is still open, and every deadline-triggered failure path opens
+//! strictly after it. So at `now == deadline`, `fund_remainder`,
+//! `fund_fx_shortfall` and `resolve_dispute` still succeed, while
+//! `expire_remainder_window`, `expire_fx_shortfall_window`,
+//! `reclaim_on_nondelivery` and `expire_dispute_window` still refuse — a
+//! payment and a default can never both be legal in the same second.
+//! Each of those four boundaries is pinned at the exact timestamp by its
+//! own test (#112–#115), not just by a clearly-before/clearly-after pair.
+//!
 //! Advance tranches use claimable-balance-equivalent semantics, built
 //! natively in this contract rather than via classic Stellar
 //! `ClaimableBalanceEntry` interop (HANDOFF.md explains why): opening a
@@ -163,11 +174,19 @@ pub enum Error {
     /// hard requirement, not just a nicety.
     TrancheUnresolved = 12,
     RemainderAlreadyFunded = 13,
+    /// `fund_remainder` called after `remainder_deadline` has *strictly*
+    /// passed — the deadline second itself is still in time.
     RemainderWindowPassed = 14,
+    /// `expire_remainder_window` called at or before
+    /// `remainder_deadline` — the deadline second itself still belongs to
+    /// the buyer's funding window, so expiry needs strictly more than the
+    /// deadline, not merely the deadline.
     RemainderWindowNotPassed = 15,
     /// `confirm_delivery` called while `ReadyForDelivery` but the buyer
     /// hasn't funded the remainder yet.
     RemainderNotFunded = 16,
+    /// `reclaim_on_nondelivery` called at or before `delivery_deadline` —
+    /// the deadline second itself still belongs to the cooperative.
     DeliveryDeadlineNotPassed = 17,
     /// `contracted_quantity` was zero at `initialize`.
     InvalidQuantity = 18,
@@ -191,8 +210,9 @@ pub enum Error {
     /// never what a caller actually wants (that's what leaving
     /// `oracle_config` as `None` is for).
     InvalidOracleConfig = 24,
-    /// `oracle_rate` called but `initialize` never set an `oracle_config`
-    /// for this commitment.
+    /// `oracle_rate` or `resolve_fx_shortfall` called but `initialize`
+    /// never set an `oracle_config` for this commitment — the only two
+    /// functions that read the oracle at all (#124).
     OracleNotConfigured = 25,
     /// The configured Reflector oracle returned `None` for
     /// `oracle_config.price_asset` — it doesn't quote that asset at all
@@ -221,20 +241,26 @@ pub enum Error {
     NoFxShortfall = 31,
     /// `fund_fx_shortfall` called a second time.
     FxShortfallAlreadyFunded = 32,
-    /// `fund_fx_shortfall` called after `fx_shortfall_deadline` passed —
-    /// too late to cure, `expire_fx_shortfall_window` is the only path
-    /// left from here.
+    /// `fund_fx_shortfall` called after `fx_shortfall_deadline` has
+    /// *strictly* passed — too late to cure, though the deadline second
+    /// itself is still in time. `expire_fx_shortfall_window` is the only
+    /// path left from here.
     FxShortfallWindowPassed = 33,
-    /// `expire_fx_shortfall_window` called before the deadline.
+    /// `expire_fx_shortfall_window` called at or before
+    /// `fx_shortfall_deadline` — the deadline second itself still belongs
+    /// to the buyer's funding window, matching `fund_fx_shortfall`'s own
+    /// inclusive cut-off (`now > deadline`).
     FxShortfallWindowNotPassed = 34,
     /// `flag_dispute`'s `flagger` argument wasn't the buyer, cooperative,
     /// or warehouse operator — only a named party to the deal can flag
     /// one, not an arbitrary third address.
     NotAParty = 35,
-    /// `resolve_dispute`/`expire_dispute_window` called before
-    /// `dispute_deadline` passed (the latter only) — or, for either
-    /// call, while `status` isn't `Disputed` at all (covered by the same
-    /// `InvalidState` every other status-gated call already uses).
+    /// `expire_dispute_window` called at or before `dispute_deadline` —
+    /// the deadline second itself is still inside the freeze. Only that
+    /// timeout path can produce this: `resolve_dispute` has no deadline
+    /// gate at all. (Either call made while `status` isn't `Disputed` is
+    /// covered by the same `InvalidState` every other status-gated call
+    /// already uses.)
     DisputeWindowNotPassed = 36,
     /// `initialize`'s `grade_price_bps` held more than
     /// `MAX_GRADE_ENTRIES` entries — longer than any real grading
@@ -391,6 +417,16 @@ pub struct Commitment {
     /// in seconds. Same window for both tranches — PRD doesn't call for
     /// different windows per tranche, so one shared value is the simpler
     /// choice until a reason to split them shows up.
+    ///
+    /// Boundary convention (#111, pinned by `tests/deadline_boundary.rs`):
+    /// the deadline is `release time + claim_window_secs`, and *claiming* is
+    /// allowed up to **and including** that instant (`timestamp > deadline`
+    /// is the rejection guard) while *reclaiming* is allowed only **strictly
+    /// after** it (`timestamp <= deadline` is the rejection guard). The two
+    /// guards are exact complements, so every ledger timestamp belongs to
+    /// exactly one party. Consequence worth knowing: the cooperative's
+    /// effective window spans `claim_window_secs + 1` distinct timestamps
+    /// (the opening one and the deadline one), not `claim_window_secs`.
     pub claim_window_secs: u64,
     /// How long the buyer has to fund the remainder once
     /// `ready_for_delivery` opens the window. Independent of
@@ -528,6 +564,19 @@ impl EscrowContract {
     /// future deposit — the cooperative and warehouse operator don't need
     /// to co-sign contract creation itself, only the state transitions
     /// that matter to them (`mark_checkpoint`, `confirm_delivery`).
+    ///
+    /// The three party addresses are *not* required to be distinct, on
+    /// purpose. Role separation is enforced where it matters — at each
+    /// state transition, by that role's own `require_auth()` — rather than
+    /// by a distinctness check here. Collapsing buyer, cooperative and
+    /// warehouse onto one principal is a legitimate deployment choice (a
+    /// cooperative that also runs the warehouse, or a minimal single-signer
+    /// validation deployment); `initialize` records the parties it is handed
+    /// and does not second-guess them. The consequence is accepted, not
+    /// hidden: with one principal in all three roles every multi-party
+    /// consent gate reduces to that single signer. See the tests
+    /// `initialize_allows_buyer_cooperative_and_warehouse_to_be_one_address`
+    /// and `all_three_identical_parties_accept_only_that_principals_signature`.
     ///
     /// `grade_price_bps` must be non-empty, may hold at most
     /// `MAX_GRADE_ENTRIES` entries, and every entry must be ≤ 10_000.
@@ -793,12 +842,23 @@ impl EscrowContract {
 
     /// Cooperative claims tranche 1, if within the window. Requires
     /// cooperative auth.
+    ///
+    /// Boundary (#111): "within" is inclusive of the deadline instant —
+    /// `claim_tranche` rejects only when `timestamp > advance1_deadline`, so
+    /// `advance1_deadline` itself is still claimable, and it is the last
+    /// instant that is. Pinned by `tests/deadline_boundary.rs`.
     pub fn claim_advance_1(env: Env) -> Result<(), Error> {
         Self::claim_tranche(&env, Tranche::One)
     }
 
     /// Buyer reclaims tranche 1, if the window has passed unclaimed.
     /// Requires buyer auth.
+    ///
+    /// Boundary (#111): the exact complement of `claim_advance_1` —
+    /// `reclaim_tranche` rejects while `timestamp <= advance1_deadline`, so
+    /// the deadline instant belongs to the cooperative's claim and the buyer's
+    /// reclaim first becomes possible at `advance1_deadline + 1`. No timestamp
+    /// ever admits both, and none admits neither.
     pub fn reclaim_advance_1(env: Env) -> Result<(), Error> {
         Self::reclaim_tranche(&env, Tranche::One)
     }
@@ -833,13 +893,15 @@ impl EscrowContract {
     }
 
     /// Cooperative claims tranche 2, if within the window. Requires
-    /// cooperative auth — same mechanics as `claim_advance_1`.
+    /// cooperative auth — same mechanics as `claim_advance_1`, including its
+    /// inclusive `advance2_deadline` boundary (#111).
     pub fn claim_advance_2(env: Env) -> Result<(), Error> {
         Self::claim_tranche(&env, Tranche::Two)
     }
 
     /// Buyer reclaims tranche 2, if the window has passed unclaimed.
-    /// Requires buyer auth — same mechanics as `reclaim_advance_1`.
+    /// Requires buyer auth — same mechanics as `reclaim_advance_1`, including
+    /// the exclusive `advance2_deadline` boundary (#111).
     pub fn reclaim_advance_2(env: Env) -> Result<(), Error> {
         Self::reclaim_tranche(&env, Tranche::Two)
     }
@@ -867,6 +929,13 @@ impl EscrowContract {
     /// `ready_for_delivery` opened, or it's a default (see
     /// `expire_remainder_window`). Requires buyer auth — this is new
     /// money the buyer specifically owes.
+    ///
+    /// The window's end is **inclusive of `remainder_deadline` itself**:
+    /// `now > remainder_deadline` is the only rejection, so a payment
+    /// landing in the deadline second still counts.
+    /// `expire_remainder_window` needs strictly more than the deadline,
+    /// which is what keeps the boundary from being ambiguous — the two
+    /// calls are never both legal at the same timestamp.
     pub fn fund_remainder(env: Env) -> Result<(), Error> {
         let mut c = Self::load(&env)?;
         if c.status != Status::ReadyForDelivery {
@@ -896,10 +965,13 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// The buyer-default path: `remainder_deadline` passed with the
-    /// remainder never funded. Sweeps whatever's currently escrowed (the
-    /// deposit, or whatever of it the cooperative hasn't already claimed)
-    /// to the cooperative and sets `Defaulted` — uncontested by
+    /// The buyer-default path: `remainder_deadline` has *strictly* passed
+    /// (`now > remainder_deadline`) with the remainder never funded — in
+    /// the deadline second itself this refuses with
+    /// `RemainderWindowNotPassed`, so the buyer's own funding window is
+    /// never cut short by a second. Sweeps whatever's currently escrowed
+    /// (the deposit, or whatever of it the cooperative hasn't already
+    /// claimed) to the cooperative and sets `Defaulted` — uncontested by
     /// construction, so unlike `cancel`/`reassign_buyer` this needs no
     /// consent from anyone.
     ///
@@ -933,9 +1005,11 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// The seller-non-delivery path: `delivery_deadline` passed without
-    /// `confirm_delivery` ever having run. Returns whatever's currently
-    /// escrowed to the buyer and sets `Forfeited`.
+    /// The seller-non-delivery path: `delivery_deadline` has *strictly*
+    /// passed (`now > delivery_deadline`; the deadline second itself still
+    /// refuses with `DeliveryDeadlineNotPassed`) without `confirm_delivery`
+    /// ever having run. Returns whatever's currently escrowed to the buyer
+    /// and sets `Forfeited`.
     ///
     /// Buyer-gated, not permissionless — unlike `expire_remainder_window`,
     /// the beneficiary here is a specific party (the buyer) reclaiming
@@ -1203,6 +1277,10 @@ impl EscrowContract {
     /// Buyer-gated, matching `fund_remainder`'s own reasoning: this is
     /// new money the buyer specifically owes, not a mechanical step
     /// anyone could trigger.
+    ///
+    /// Deadline-**inclusive**, exactly like `fund_remainder`:
+    /// `now > fx_shortfall_deadline` is the only rejection, so the
+    /// deadline second itself is still the buyer's to pay in.
     pub fn fund_fx_shortfall(env: Env) -> Result<(), Error> {
         let mut c = Self::load(&env)?;
         if c.status != Status::Delivered {
@@ -1231,8 +1309,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// The FX-shortfall buyer-default path: `fx_shortfall_deadline`
-    /// passed with the top-up never funded. Sweeps whatever's currently
+    /// The FX-shortfall buyer-default path: `fx_shortfall_deadline` has
+    /// *strictly* passed (`now > fx_shortfall_deadline`; the deadline
+    /// second itself still refuses with `FxShortfallWindowNotPassed`) with
+    /// the top-up never funded. Sweeps whatever's currently
     /// escrowed to the cooperative and sets `Status::Defaulted` — the
     /// *same* status `expire_remainder_window`'s buyer-default already
     /// uses, by explicit product decision (see module doc), which means
@@ -1428,6 +1508,12 @@ impl EscrowContract {
     /// arbitration by another name. If the parties' off-chain resolution
     /// is "unwind the deal," they call the existing `cancel()` next,
     /// same as they would have without ever disputing.
+    ///
+    /// **Deadline-free on purpose**: unlike `expire_dispute_window`, this
+    /// carries no `dispute_deadline` check at all, so it stays callable in
+    /// the deadline second itself and after it. Unanimous consent is the
+    /// only gate — the timeout exists to break a deadlock, never to take
+    /// the decision away from three parties who have already agreed.
     pub fn resolve_dispute(env: Env) -> Result<(), Error> {
         let mut c = Self::load(&env)?;
         if c.status != Status::Disputed {
@@ -1455,6 +1541,12 @@ impl EscrowContract {
     /// Whatever normal deadline-triggered mechanism would otherwise have
     /// applied (`expire_remainder_window`, `reclaim_on_nondelivery`,
     /// etc.) is free to run again from there.
+    ///
+    /// Deadline-**exclusive**: `now > dispute_deadline` is required, so in
+    /// the deadline second itself this still refuses with
+    /// `DisputeWindowNotPassed` while `resolve_dispute` remains available —
+    /// the boundary second is never a dead zone where neither resume path
+    /// works.
     pub fn expire_dispute_window(env: Env) -> Result<(), Error> {
         let mut c = Self::load(&env)?;
         if c.status != Status::Disputed {

@@ -1,0 +1,40 @@
+# #125 snapshot: HANDOFF.md Deployment 5 scenario 2 — buyer default.
+snapshot = deployment-5-buyer-default
+provenance = derived from HANDOFF.md "Verified on testnet", Deployment 5 scenario 2,
+   contract CA3AB4QXJ5ZZ4SIIH3VHI7C37MDWBUQSZECT64XBVHPDQI473BJK4G52: 10%/20%
+   split, a deliberately short 15-second remainder window, advance 1 claimed at
+   100,000,000, advance 2 deliberately left unclaimed, and `expire_remainder_window`
+   sweeping the contract's remaining 200,000,000 to the cooperative and setting
+   Defaulted — called by the deployer account, neither the buyer nor the
+   cooperative. Amounts are as read back off the ledger; no transaction XDR was
+   captured. The non-party caller is not reproducible from a fixture (every
+   snapshot here runs under `mock_all_auths`); the permissionless-auth property
+   itself is covered by src/test.rs.
+total_amount = 1000000000
+advance1_bps = 1000
+advance2_bps = 2000
+claim_window_secs = 604800
+remainder_window_secs = 15
+delivery_window_secs = 1036800
+contracted_quantity = 1000
+grade_price_bps = 10000,9000,7500
+buyer_mint = 1000000000
+
+step = lock => ok
+step = release_advance_1 => ok
+step = claim_advance_1 => ok
+check = coop_balance 100000000
+check = contract_balance 200000000
+step = mark_checkpoint => ok
+step = release_advance_2 => ok
+step = ready_for_delivery => ok
+step = advance 16
+# recorded: the buyer never called `fund_remainder`; the window is not curable late.
+step = fund_remainder => err(RemainderWindowPassed)
+step = expire_remainder_window => ok
+# recorded: the sweep is the contract's *current* balance (200,000,000), not a
+# naive full-total figure, and the status is Defaulted.
+check = coop_balance 300000000
+check = contract_balance 0
+check = buyer_balance 700000000
+check = status Defaulted

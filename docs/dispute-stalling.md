@@ -262,6 +262,12 @@ analysis, and the analysis is that the current mechanism is a cheap,
 repeatable, unpunished delay for the party who benefits most from
 delay.
 
+This revises verdict 16 in [`threat-model.md`](./threat-model.md), which
+rated the same attack "accepted risk, bounded": the timeout bounds a single
+freeze, but nothing in the contract bounds the number of freezes, and the
+late-delivery case in §3.1 means a pause can change an outcome rather than
+only delay one.
+
 ## 5. What a stall cannot do
 
 To keep the finding in proportion:

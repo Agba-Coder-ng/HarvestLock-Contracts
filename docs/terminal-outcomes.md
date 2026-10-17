@@ -19,7 +19,11 @@ Companion docs from the same review pass:
 can do by doing nothing), [`dispute-stalling.md`](./dispute-stalling.md)
 (whether a spurious flag pays), and
 [`dispute-frontrunning.md`](./dispute-frontrunning.md) (which pending
-calls are worth racing).
+calls are worth racing). The risk-register companion is
+[`threat-model.md`](./threat-model.md); §7 below is the source for its
+reputation-consequence entries, and it is where the two docs disagree about
+whether an outcome can be changed by pausing (it cannot, with the
+late-delivery exception in §5.4).
 
 ## TL;DR
 

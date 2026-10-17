@@ -322,3 +322,8 @@ value-for-complexity order:
 None of these are implemented in this PR — this issue asked for the
 analysis, and the analysis is that the contract is safe against theft by
 inaction but not against **value being locked or delayed** by it.
+
+This extends [`threat-model.md`](./threat-model.md)'s trust assumption 2
+("the warehouse operator is honest") with what happens when it is simply
+*absent* rather than dishonest, and its stalling verdict 16 with the
+griefing paths that need no dispute at all.

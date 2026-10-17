@@ -287,3 +287,11 @@ This issue asked for a write-up, not a code change, so none of these
 fixes are implemented here. The races are documented with the exact
 guards that create them so the eventual fix is a reviewable delta rather
 than a rediscovery.
+
+Where this revises [`threat-model.md`](./threat-model.md): verdict 14 gains
+the `claim`/`reclaim` exception (§2), verdict 16 loses its "bounded" claim
+(§3.4), verdict 18 becomes "partially defended" because one-shot resolution
+is still a first-caller race (§3.3), and the out-of-scope "front-running /
+MEV around permissionless calls" row becomes in-scope for the two
+order-dependent transfers in §3.1 and §3.2. Each change carries the reason
+in the threat model's own entry, per its maintenance section.

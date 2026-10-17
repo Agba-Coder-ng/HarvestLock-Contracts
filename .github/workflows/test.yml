@@ -44,8 +44,8 @@ jobs:
         working-directory: contracts/escrow
         run: cargo test --locked --verbose
 
-  clippy:
-    name: Clippy pedantic and nursery
+  coverage:
+    name: code coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -64,10 +64,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Keep these advisory until the existing baseline is deliberately
-      # reduced; see docs/clippy-triage.md for the one-time triage.
-      - name: Check Clippy pedantic and nursery lints
-        run: cargo clippy --workspace --all-targets --locked -- -W clippy::pedantic -W clippy::nursery
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Report line coverage
+        run: cargo llvm-cov --workspace --all-targets --locked
 
   # ---------------------------------------------------------------------
   # #111, #122, #124, #125 — four integration suites, each its own job so

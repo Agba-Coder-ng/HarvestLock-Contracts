@@ -141,7 +141,7 @@ being created in `Draft` is an initial state, not a transition into one.
 This is the primitive `api/`'s read-triggered cache refresh has been
 waiting for; shipped contract-side only, no consumer exists yet.
 
-Tests (**194 passing: 159 in `src/test.rs`, 35 across `tests/`** — see the
+Tests (**210 passing: 164 in `src/test.rs`, 46 across `tests/`** — see the
 "Last updated"
 entry for the count's history) cover, beyond last session's set: `lock` escrows
 only the deposit, not the full total; `ready_for_delivery` opens the window
@@ -572,6 +572,16 @@ so nobody "fixes" them without knowing what they're trading off.
    today (this session's tests use GBP) and activates for NGN
    automatically the day Reflector adds it — no code change needed,
    just a different `price_asset` string at `initialize`.
+   **#1's "waiting on a fresh quote" signal is now built**: a stale
+   quote still refuses `resolve_fx_shortfall` outright, and since a
+   Soroban invocation returning `Err` rolls back every write, that
+   refusal can't record why — so the new permissionless probe
+   `refresh_fx_quote_status` records the answer in the new
+   `Commitment::fx_quote_stale` flag, which `get_commitment` surfaces.
+   Deliberately a boolean flag alongside `fx_resolved`, not a distinct
+   `Status` variant (it's a condition on one settlement sub-step, not a
+   position in the deal's lifecycle), and informational only — no guard
+   reads it, `resolve_fx_shortfall` still enforces staleness itself.
 4. ~~No allocation ledger.~~ **Built** (Deployment 7, 4 Sept 2026, see
    above): `set_allocation`/`get_allocation`, per-member salted hashes,
    record-only (PRD §4.9 Rung 1, the v1 default, not a deferred
@@ -590,8 +600,22 @@ so nobody "fixes" them without knowing what they're trading off.
    as it always could — this was never a security boundary, just the
    right layer for a business-judgment default.
 6. **`release_advance_1`/`release_advance_2` remain not auth-gated** (see
-   "Design decisions" — this is deliberate, not new this session, but
-   still worth a security reviewer's attention on sight).
+   "Design decisions" — this is deliberate, not new this session).
+   **Reviewed on the record (#2)**: `docs/permissionless-release-review.md`
+   stress-tests the adversarial-timing scenarios this note used to flag
+   (early clock-start griefing, restart/extension, every downstream
+   reader of the two deadline fields, dispute-freeze interaction) and
+   concludes the permissionless shape holds — recorded confirmation, not
+   a code change to the auth shape. Every claim in that review is pinned
+   by the dedicated suite
+   `contracts/escrow/tests/permissionless_release_review.rs` (own CI
+   job), including the issue's end-to-end third-party griefing scenario.
+   If a deployment ever needs a *minimum* time before a tranche may
+   open, the review's own answer is a term fixed at `initialize` (a new
+   eligibility condition both parties can see), not a signature gate —
+   the latter would create a timing veto the non-custodial design
+   deliberately gives nobody (PRD §4.5) while adding a liveness
+   dependency, not safety.
 
 ## Design decisions worth knowing before you change anything
 
@@ -842,7 +866,52 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 17 Oct 2026 — #63, the Reflector `decimals()` question:
+*Last updated: 17 Oct 2026 (later) — issues **#1** and **#2**, one new
+contract call plus a written security review. 210 tests total, measured:
+164 in `src/test.rs` (6 new), 46 across `tests/` (7 `address_equality`,
+12 `deadline_boundary`, 13 `oracle_fault_injection`, 10 new
+`permissionless_release_review`, 4 `snapshot_replay`). **#1 — the
+"waiting on a fresh quote" signal**: a Soroban invocation returning
+`Err` rolls back every write, so `resolve_fx_shortfall`'s `OracleStale`
+could never persist a marker of why settlement is stuck. New
+permissionless `refresh_fx_quote_status` runs the same staleness check
+and records the answer in the new `Commitment::fx_quote_stale` (struct
+field 33), which `get_commitment` surfaces; a fresh probe clears it, and
+so does a successful `resolve_fx_shortfall`, so it can't linger past
+resolution. A *missing* quote propagates as an error rather than setting
+anything — "never quoted at all" is a config gap, not "come back later."
+Refuses `InvalidState` outside `Delivered`, `OracleNotConfigured`,
+`FxAlreadyResolved`. Deliberately a boolean alongside `fx_resolved`,
+not a `Status` variant (a condition on one settlement sub-step, not a
+lifecycle position — plus every extra variant is one more restore target
+the dispute freeze/resume pair would need to reason about);
+informational only, no guard reads it, worst case is a misleading
+display. 6 new tests in `src/test.rs`, none removed — measured lib
+total 164, which corrects the prior entries' 159/156 by one (the
+count line above is the measured one). **#2 — permissionless
+release review, on the record**: `docs/permissionless-release-review.md`
+pins the verdict that `release_advance_1/2` stay permissionless (no auth
+gate added): clock written exactly once, no funds move, lapse beneficiary
+is always the buyer, cooperative always gets the full
+`claim_window_secs` from whenever the window opened — with "what would
+change the verdict" spelled out (a term fixed at `initialize`, not a
+signature gate). Every claim is pinned by the new 10-test suite
+`contracts/escrow/tests/permissionless_release_review.rs`, given its own
+CI job in `.github/workflows/test.yml`, including the issue's
+end-to-end third-party griefing scenario. Doc comments on both calls
+updated to state the review's conclusion; `docs/authorization-matrix.md`
+(29 → 30 public functions, 7 → 8 permissionless, new row) and
+`docs/threat-model.md` (§21 reworded with the #2 suite named, roles
+table updated) brought in line; `docs/ts-bindings-comparison.md` stopped
+citing a now-drifting field count. Guard scripts re-run green after the
+new method: discriminants 1..38 sequential, auth docs cover all 30
+public methods. Snapshots: the record-only convention applied harder
+this session — the new suites' snapshots are untracked and the 136
+tracked files that a local re-run re-recorded (the new `fx_quote_stale`
+field, `live_until` drift) were restored to HEAD rather than committed,
+same reasoning as the prior entries below.
+
+Prior entry: 17 Oct 2026 — #63, the Reflector `decimals()` question:
 documented finding plus one test, no contract behavior changed. `oracle_rate()`
 performs *no* conversion math — it returns the raw `price` from `lastprice`
 and never calls the oracle's `decimals()` — so a change to Reflector's

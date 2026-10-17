@@ -39,8 +39,29 @@ a storage-TTL audit with a real fix — `bump_instance_ttl` re-rents the
 contract instance (and code) entry from `load`/`initialize` when its
 lifetime has decayed below half the network max, closing the gap where
 a dormant `Locked` escrow's own state could be archived while still
-needed (`docs/storage-ttl.md`; #98). No deployment entry until the next
-build goes to testnet.
+needed (`docs/storage-ttl.md`; #98).
+
+Security review of the permissionless tranche-opening calls, on the
+record (#2): `docs/permissionless-release-review.md` answers the open
+"is this actually safe?" question with a full reader audit of
+`advance1_deadline`/`advance2_deadline` and the adversarial-timing
+scenarios the issue named, pinned by a dedicated regression suite
+(`contracts/escrow/tests/permissionless_release_review.rs`, its own CI
+job). Verdict: the permissionless shape holds — recorded confirmation,
+no auth gate added; the `release_advance_1/2` doc comments now state the
+conclusion instead of only the defensive one-liner.
+
+A distinct "waiting on a fresh quote" signal for stale-oracle
+settlement blocks (#1): new permissionless `refresh_fx_quote_status`
+records a stale oracle quote into the new `Commitment::fx_quote_stale`
+flag, which `get_commitment` surfaces, so callers can see settlement is
+waiting on a fresh Reflector quote instead of inferring it from a
+failed `resolve_fx_shortfall`. Deliberately a boolean flag alongside
+`fx_resolved`, not a new `Status` variant; informational only — no
+guard reads it (`resolve_fx_shortfall` still enforces staleness
+itself, and its `OracleStale` refusal still can't persist a marker of
+its own, which is exactly why the probe is a separate call). No
+deployment entry until the next build goes to testnet.
 
 ## [Deployment 10] — 2026-09-06
 

@@ -90,8 +90,8 @@ bounded by a caller-chosen freshness bound rather than trusted outright.
 | **Buyer** | Their Stellar key; the deal's terms at `initialize` (amounts, bps, windows, token, oracle config) | `initialize`, `lock`, `fund_remainder`, `fund_fx_shortfall`, `reclaim_advance_*`, `reclaim_on_nondelivery`; co-sign `cancel` / `reassign_buyer`; flag a dispute | Unilaterally cancel; confirm delivery; claim an advance; withhold `settle` once its conditions are met; claw back an advance the cooperative already claimed; amend terms after `initialize` (no setter exists) |
 | **Cooperative** | Their Stellar key; the member list authored pre-`lock` | `set_allocation` (once, pre-`lock`), `claim_advance_*`, `ready_for_delivery`; co-sign `cancel` / `reassign_buyer`; flag a dispute | Attest checkpoint or delivery; cancel alone; force `settle` early; change or amend the allocation after `lock`; receive the remainder before the buyer funds it |
 | **Warehouse operator** | Their Stellar key; their own off-chain grading/appeals process | `mark_checkpoint`, `confirm_delivery` (the attestation that unlocks settlement); flag a dispute | Move funds — the contract never pays the operator anything; adjudicate disputes on chain; alter `grade_price_bps` (fixed at `initialize`); be over-paid or directed anywhere by any call |
-| **Any third party** (stranger, indexer, griefer) | Nothing on chain | Call the 7 permissionless functions, which can only *complete a check the deal already fixed*; call any view | Flag a dispute (`NotAParty`); call any gated function; supply an outcome, destination, or amount to any call; read anything secret — no confidentiality is claimed, none exists |
-| **Reflector oracle** (external) | Its own published quotes | Supply the rate `oracle_rate` / `resolve_fx_shortfall` read | Choose the staleness bound, the asset symbol, or the oracle address — all fixed by the buyer at `initialize`; supply a stale quote as if fresh (`OracleStale`, a hard error) |
+| **Any third party** (stranger, indexer, griefer) | Nothing on chain | Call the 8 permissionless functions, which can only *complete a check the deal already fixed*; call any view | Flag a dispute (`NotAParty`); call any gated function; supply an outcome, destination, or amount to any call; read anything secret — no confidentiality is claimed, none exists |
+| **Reflector oracle** (external) | Its own published quotes | Supply the rate `oracle_rate` / `resolve_fx_shortfall` / `refresh_fx_quote_status` read | Choose the staleness bound, the asset symbol, or the oracle address — all fixed by the buyer at `initialize`; supply a stale quote as if fresh (`OracleStale`, a hard error) |
 | **HarvestLock / API maintainers** (off-chain) | Which transactions get built and submitted; the reputation store | Build, sign-request, and submit transactions on behalf of users; censor users *off chain*; enforce the default/forfeiture bars app-side | Sign *as* any party, pause, upgrade, drain, or redirect the contract — no HarvestLock address exists anywhere in the contract (PRD §4.5) |
 | **Member farmers** (record subjects) | Their off-chain identity | Nothing — no member key is ever a contract principal | Read or alter their on-chain `member_hash` row; be paid by the contract (v1 `settle` pays the cooperative a lump sum) |
 | **Deployers / maintainers** | Source code, CI, the WASM hash | Ship a new contract version; review PRs | Change a deployed instance — there is no upgrade entrypoint, by design |
@@ -106,8 +106,8 @@ the only funds at risk before then are the buyer's own.
 
 ## The authorization surface in one screen
 
-29 public functions, 5 shapes, **zero un-gated fund-moving paths** — 13
-single-party gates, 7 permissionless state changes, 3 multi-party mutual
+30 public functions, 5 shapes, **zero un-gated fund-moving paths** — 13
+single-party gates, 8 permissionless state changes, 3 multi-party mutual
 actions, 1 caller-authenticated flag, 5 no-auth views. The full table with
 PRD citations is [`authorization-matrix.md`](./authorization-matrix.md) §1;
 this doc only assumes its central invariant:
@@ -360,19 +360,32 @@ anything Reflector does quote and activates for NGN with no code change.
 Tracked in HANDOFF's next steps as an upstream-feed gap.
 
 #### 21. A third party seizes the timing of a permissionless first call
-**Verdict: accepted risk, bounded.** Anyone can start a clock the state
-machine has already authorized (`release_advance_*`, `settle`,
-`resolve_fx_shortfall`, the `expire_*` sweeps) the moment it becomes
+**Verdict: accepted risk, bounded — and for the two tranche-opening calls,
+reviewed on the record (#2, see
+[permissionless-release-review.md](./permissionless-release-review.md)).**
+Anyone can start a clock the state machine has already authorized
+(`release_advance_*`, `settle`, `resolve_fx_shortfall`,
+`refresh_fx_quote_status`, the `expire_*` sweeps) the moment it becomes
 eligible. Because those calls take no outcome parameter and only complete
 pre-fixed facts (authorization-matrix §2), the worst a griefer can do is
 trigger an outcome the terms already dictate — or pick the instant of an FX
 resolution among moments the oracle genuinely published, itself bounded by
-the staleness bound and freezable by a dispute. Tests pinning what
+the staleness bound and freezable by a dispute. For `release_advance_*`
+specifically: the clock is written exactly once (no restart/extension),
+nothing downstream trusts its provenance, a lapsed window reverts to the
+buyer (never the caller), and the cooperative always gets the full
+`claim_window_secs` from whenever the window opened. Tests pinning what
 permissionless *cannot* do:
 `release_advance_1_opens_window_but_transfers_nothing`,
 `expire_remainder_window_is_permissionless`,
 `expire_dispute_window_is_permissionless`,
-`cannot_expire_remainder_window_before_deadline`.
+`cannot_expire_remainder_window_before_deadline`, and the dedicated #2
+suite (`tests/permissionless_release_review.rs`):
+`the_clock_cannot_be_restarted_or_extended_once_open`,
+`a_stranger_cannot_claim_a_window_it_opened`,
+`a_stranger_cannot_reclaim_a_window_it_opened`,
+`no_clock_can_be_started_during_a_dispute_freeze`,
+`the_full_griefing_scenario_pays_only_the_entitled_parties`.
 
 ### Inputs, resources, and payout math
 

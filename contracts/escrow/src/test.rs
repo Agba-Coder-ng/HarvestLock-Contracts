@@ -2142,6 +2142,16 @@ fn confirm_delivery_rejects_an_out_of_range_grade_index() {
     // GRADE_PRICE_BPS has 3 entries (indices 0-2) -- 3 is out of range.
     let result = s.contract.try_confirm_delivery(&CONTRACTED_QUANTITY, &3);
     assert_eq!(result, Err(Ok(Error::InvalidGradeIndex)));
+
+    // #95: the rejection also pins that nothing was persisted — the
+    // bounds check runs before any mutation and before the sole `save`,
+    // so the stored commitment is exactly as `advance_to_remainder_funded`
+    // left it (see `confirm_delivery`'s doc comment for the full trace).
+    assert_eq!(s.contract.get_status(), Status::ReadyForDelivery);
+    let c = s.contract.get_commitment();
+    assert_eq!(c.delivered_quantity, 0);
+    assert_eq!(c.grade_index, 0);
+    assert_eq!(c.settlement_bps, 0);
 }
 
 #[test]

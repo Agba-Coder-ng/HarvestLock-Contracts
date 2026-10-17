@@ -141,7 +141,8 @@ being created in `Draft` is an initial state, not a transition into one.
 This is the primitive `api/`'s read-triggered cache refresh has been
 waiting for; shipped contract-side only, no consumer exists yet.
 
-Tests (`src/test.rs`, **147 tests, all passing** — see the "Last updated"
+Tests (**194 passing: 159 in `src/test.rs`, 35 across `tests/`** — see the
+"Last updated"
 entry for the count's history) cover, beyond last session's set: `lock` escrows
 only the deposit, not the full total; `ready_for_delivery` opens the window
 and is cooperative-gated; `fund_remainder` transfers exactly the remainder,
@@ -739,6 +740,24 @@ so nobody "fixes" them without knowing what they're trading off.
   transition into `Defaulted`) applies automatically, with zero API
   changes needed to enforce it consistently with the original
   `expire_remainder_window` default.
+- **Why TTL maintenance lives in `load()`/`initialize()` rather than in
+  every mutating method** (#98): every key this contract has — the
+  `Commitment`, the `OracleConfig`, each `Allocation` entry, and the
+  dispute fields (which live *inside* `Commitment`, not as separate keys)
+  — lives in one instance storage entry sharing one TTL, and Soroban does
+  **not** auto-extend an instance on invocation. `load()` is the single
+  choke point every state-reading call passes through, so the private
+  `bump_instance_ttl` helper there (plus one direct call in `initialize`,
+  the only entry point that doesn't read through `load`) keeps the whole
+  entry — the host bumps the WASM code entry alongside it — live for any
+  active commitment without scattering rent management across 29 methods.
+  The threshold is `max_ttl / 2`, so a commitment in normal use pays
+  extension rent once per half-max TTL (amortized), not per call. The
+  residual gap this deliberately does not paper over: a commitment
+  touched zero times for more than `max_entry_ttl` ledgers still
+  archives; recovery is off-chain (`stellar contract extend`/`restore`,
+  or polling a read path like `get_status` as a keeper — every read
+  re-rents). Full audit: `docs/storage-ttl.md`.
 
 ## Next steps, in priority order
 

@@ -141,7 +141,8 @@ being created in `Draft` is an initial state, not a transition into one.
 This is the primitive `api/`'s read-triggered cache refresh has been
 waiting for; shipped contract-side only, no consumer exists yet.
 
-Tests (`src/test.rs`, **147 tests, all passing** — see the "Last updated"
+Tests (**194 passing: 159 in `src/test.rs`, 35 across `tests/`** — see the
+"Last updated"
 entry for the count's history) cover, beyond last session's set: `lock` escrows
 only the deposit, not the full total; `ready_for_delivery` opens the window
 and is cooperative-gated; `fund_remainder` transfers exactly the remainder,
@@ -739,6 +740,24 @@ so nobody "fixes" them without knowing what they're trading off.
   transition into `Defaulted`) applies automatically, with zero API
   changes needed to enforce it consistently with the original
   `expire_remainder_window` default.
+- **Why TTL maintenance lives in `load()`/`initialize()` rather than in
+  every mutating method** (#98): every key this contract has — the
+  `Commitment`, the `OracleConfig`, each `Allocation` entry, and the
+  dispute fields (which live *inside* `Commitment`, not as separate keys)
+  — lives in one instance storage entry sharing one TTL, and Soroban does
+  **not** auto-extend an instance on invocation. `load()` is the single
+  choke point every state-reading call passes through, so the private
+  `bump_instance_ttl` helper there (plus one direct call in `initialize`,
+  the only entry point that doesn't read through `load`) keeps the whole
+  entry — the host bumps the WASM code entry alongside it — live for any
+  active commitment without scattering rent management across 29 methods.
+  The threshold is `max_ttl / 2`, so a commitment in normal use pays
+  extension rent once per half-max TTL (amortized), not per call. The
+  residual gap this deliberately does not paper over: a commitment
+  touched zero times for more than `max_entry_ttl` ledgers still
+  archives; recovery is off-chain (`stellar contract extend`/`restore`,
+  or polling a read path like `get_status` as a keeper — every read
+  re-rents). Full audit: `docs/storage-ttl.md`.
 
 ## Next steps, in priority order
 
@@ -823,7 +842,49 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 16 Oct 2026 (night) — exact-deadline boundary coverage for all
+*Last updated: 17 Oct 2026 — issues #95–#98 review set: one real
+contract-behavior fix (instance TTL), three documentation conclusions, one
+new end-to-end test, two new TTL tests. 191 → 194 tests, all passing.
+**#95**: traced `confirm_delivery` before assuming anything — the
+`grade_index` bounds check runs against storage state *before* any
+mutation, auth comes next, and exactly one `save` follows; a rejected
+index can never be persisted, and even a hypothetical refactored ordering
+is covered by Soroban's whole-transaction rollback. No gap, no new test —
+the existing `confirm_delivery_rejects_an_out_of_range_grade_index` pins
+the rejection, extended in this session to also assert the stored
+commitment stays untouched after it; the trace conclusion now lives in
+the function's doc comment. **#96**: `lock` is the first and only place funds move — an
+abandoned `Draft` commitment holds **zero** funds (its token balance is
+provably zero), `cancel` from `Draft` refunds nothing to anyone, and
+`reclaim_on_nondelivery` deliberately rejects `Draft`; the only residue is
+the storage entry, whose lifetime is #98's subject. Written into
+`initialize`'s doc comment. **#97**: `docs/minimal-example.md` — the
+smallest legal `initialize` (single-entry grade schedule,
+`oracle_config = None`) walked through every call to `settle` with
+balances at each step; the issue pointed at `api/test/stellar.test.ts`,
+which lives in the sibling `api/` app repo, not this one, so the
+walkthrough is instead pinned by
+`minimal_commitment_walkthrough_settles_end_to_end` in `src/test.rs`
+(local test host, no testnet deploy — none was needed and this session
+holds no funded network keys). **#98**: genuine gap, fixed — the contract
+had **zero** `extend_ttl` calls and Soroban does not auto-extend on
+invocation, while all three `DataKey` variants share the one instance
+storage entry and one TTL; a commitment dormant past `max_entry_ttl`
+archives mid-lifecycle. New private `bump_instance_ttl` (called from
+`load()` and `initialize()`, extends when remaining TTL < max/2, so
+active commitments re-rent amortized rather than per-call; the host bumps
+the WASM code entry with the instance) closes it for any commitment
+touched at least once per max-TTL window; the zero-touch residual and its
+off-chain mitigations (`stellar contract extend`/`restore`, read-path
+keeper) are written up in `docs/storage-ttl.md` with the per-entry audit.
+Two tests pin the mechanics empirically
+(`dormant_instance_is_rescued_by_the_first_call`,
+`locked_commitment_survives_long_dormancy_via_read_path_ttl_bumps`).
+No error variants added, so the discriminant and auth-doc guard scripts
+pass unchanged. Snapshots for the three new tests deliberately **not
+committed** — same record-only reasoning as the prior entry below.*
+
+Prior entry: 16 Oct 2026 (night) — exact-deadline boundary coverage for all
 four absolute deadlines (#112–#115): tests only, plus doc-comment corrections,
 no contract behavior changed. Each of `remainder_deadline`,
 `delivery_deadline`, `fx_shortfall_deadline` and `dispute_deadline` now has a

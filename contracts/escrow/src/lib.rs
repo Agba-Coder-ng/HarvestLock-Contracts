@@ -100,6 +100,20 @@
 //! transition into `Defaulted`. One-time and computed exactly once per
 //! commitment: re-resolving later against a different rate would let
 //! either side game the number by choosing when to call it.
+//!
+//! **Storage lifetime (#98)**: every persistent fact this contract keeps —
+//! the `Commitment` struct, the allocation ledger, the oracle config, and
+//! the dispute fields (which live *inside* `Commitment`, not under
+//! separate keys) — is instance storage, i.e. one `ContractData` ledger
+//! entry with one TTL, and nothing here uses `env.storage().persistent()`
+//! or `temporary()`. Soroban does **not** extend a contract instance's
+//! TTL merely because the contract was called, and a commitment can
+//! legitimately sit in `Draft` or `Locked` with no deadline forcing
+//! anyone to act; so every read path funnels through `load`, which
+//! re-rents the entry when its remaining lifetime has decayed below half
+//! the network maximum (see `bump_instance_ttl`'s doc comment). The full
+//! key-by-key audit, the residual expiry risk, and the operational
+//! mitigations live in `docs/storage-ttl.md`.
 
 #![no_std]
 
@@ -580,6 +594,29 @@ impl EscrowContract {
     ///
     /// `grade_price_bps` must be non-empty, may hold at most
     /// `MAX_GRADE_ENTRIES` entries, and every entry must be ≤ 10_000.
+    ///
+    /// **A commitment abandoned at Draft forever (#96)**: this call moves
+    /// no funds, and `lock` is the first and only place in the whole
+    /// contract where funds can enter — every token transfer into the
+    /// contract happens inside `lock` (the deposit) or `fund_remainder` /
+    /// `fund_fx_shortfall` (both unreachable before `lock`, since their
+    /// status guards require states only `lock` can produce). So for a
+    /// commitment that is deployed, initialized, and then simply never
+    /// touched again while still `Draft`: **there are no funds at stake to
+    /// reclaim, because none ever left the buyer.** The contract's balance
+    /// of `token` is provably zero — the buyer never approved or sent
+    /// anything, and a `balance()` call on the token contract for this
+    /// address confirms it independently of this contract's own state. The
+    /// formal unwind does exist even at this stage — `cancel` is reachable
+    /// from `Draft` and refunds the contract's whole balance to the buyer,
+    /// which here refunds zero and just records the `Cancelled`
+    /// transition — but it needs both the buyer's and the cooperative's
+    /// consent, and consent is not needed to *protect* anyone: with no
+    /// funds escrowed there is nothing for a reclamation path to reclaim.
+    /// `reclaim_on_nondelivery` deliberately refuses `Draft` for the same
+    /// reason. The only thing an abandoned Draft leaves behind is its
+    /// storage entry, whose lifetime (and eventual archival) is covered by
+    /// docs/storage-ttl.md — a dead record, not lost money.
     pub fn initialize(
         env: Env,
         buyer: Address,
@@ -667,6 +704,11 @@ impl EscrowContract {
         if let Some(oc) = oracle_config {
             env.storage().instance().set(&DataKey::OracleConfig, &oc);
         }
+        // `initialize` is the only public entry point that doesn't read
+        // through `load` (there's nothing to load yet), so it extends the
+        // instance's TTL directly — the entry otherwise carries only
+        // whatever lifetime `deploy` gave it (#98, see `bump_instance_ttl`).
+        Self::bump_instance_ttl(&env);
         Ok(())
     }
 
@@ -1068,7 +1110,39 @@ impl EscrowContract {
     /// via `Self::save` upon state transition to `Status::Delivered`. No
     /// redundant reads or writes occur across the quantity/grade calculation
     /// or final state-write.
-    pub fn confirm_delivery(env: Env, delivered_quantity: u32, grade_index: u32) -> Result<(), Error> {
+    ///
+    /// **Atomicity review of the `grade_index` bounds check (#95)** — the
+    /// exact order of operations, traced from the code, is: `load` (read
+    /// only) → status guard → `remainder_funded` guard → the `grade_index`
+    /// bounds check against `grade_price_bps` → `warehouse_operator
+    /// .require_auth()` → in-memory mutation of the local copy → a single
+    /// `save`. The bounds check therefore runs **before any state
+    /// mutation** — and before auth is consumed — so an out-of-range grade
+    /// rejects with `InvalidGradeIndex` and nothing was ever written: there
+    /// is no partially-updated commitment for this function to leave
+    /// behind, today or via the obvious refactor mistake (mutate-then-check)
+    /// landing unnoticed, for two independent reasons: (1) all mutations
+    /// touch only the in-memory `c` and the sole storage write sits after
+    /// every guard, and (2) even if a guard *were* reordered after `save`,
+    /// a Soroban invocation that returns an error has its entire ledger
+    /// footprint rolled back by the host — instance-storage writes and
+    /// published events alike — so the failure would still leave the prior
+    /// `Commitment` intact. Soroban's rollback alone would make this safe
+    /// by construction; the current check-before-mutate ordering is kept
+    /// because it additionally fails before burning the warehouse
+    /// operator's auth and keeps the effects-before-interactions invariant
+    /// (the only external call sites in this contract are token transfers,
+    /// and this function does none) honest rather than load-bearing. This
+    /// is a recorded conclusion, not an assumption — and it is why #95
+    /// adds no new test: the ordering has no gap to cover, and the
+    /// rejection itself is already pinned by
+    /// `confirm_delivery_rejects_an_out_of_range_grade_index`, which
+    /// asserts both the error and the untouched stored state.
+    pub fn confirm_delivery(
+        env: Env,
+        delivered_quantity: u32,
+        grade_index: u32,
+    ) -> Result<(), Error> {
         let mut c = Self::load(&env)?;
         if c.status != Status::ReadyForDelivery {
             return Err(Error::InvalidState);
@@ -1576,7 +1650,47 @@ impl EscrowContract {
 
     // -- internal --
 
+    /// The single TTL-extension point for this contract's storage (#98).
+    ///
+    /// Every entry this contract writes lives in *instance* storage —
+    /// `DataKey::Commitment`, `DataKey::Allocation`, and
+    /// `DataKey::OracleConfig` are all fields of one `ContractData`
+    /// ledger entry (the contract instance itself), so extending that
+    /// one entry keeps all of them (and the contract's own WASM code
+    /// entry, which `Instance::extend_ttl` bumps together with the
+    /// instance) alive at once. Nothing here uses `env.storage()
+    /// .persistent()` or `temporary()`, so there are no per-key TTLs to
+    /// manage — see docs/storage-ttl.md for the full audit and why this
+    /// shape (one entry, one TTL, one extension point) is the finding.
+    ///
+    /// Without this call the entry would keep only the TTL it got at
+    /// deploy time (`min_persistent_entry_ttl` ledgers): Soroban does
+    /// *not* auto-extend a contract instance when it is invoked, so a
+    /// commitment with no activity — legitimately possible in `Draft`
+    /// or `Locked`, where no deadline forces anyone to act — would see
+    /// its own state archived out from under its escrow. Strategy:
+    /// re-rent only once the remaining lifetime has decayed below half
+    /// the network maximum, topping back up to that maximum. Actively
+    /// used commitments therefore pay extension rent at most once per
+    /// half-max lifetime (most calls are a free no-op above the
+    /// threshold), and any dormant one is rescued back to full lifetime
+    /// by the first read — including the API's routine
+    /// `get_status`/`get_commitment` polling. A commitment left
+    /// untouched for *longer* than the network max lifetime still
+    /// expires; that residual is inherent to any Soroban storage model
+    /// short of periodic keeper transactions, and docs/storage-ttl.md
+    /// documents the mitigation (`stellar contract extend`/`restore`
+    /// and the watcher pattern) rather than pretending it away.
+    fn bump_instance_ttl(env: &Env) {
+        let max_ttl = env.storage().max_ttl();
+        env.storage().instance().extend_ttl(max_ttl / 2, max_ttl);
+    }
+
     fn load(env: &Env) -> Result<Commitment, Error> {
+        // Every public entry point except `initialize` reads through
+        // here, which is what makes `bump_instance_ttl` above the one
+        // place the TTL actually needs maintaining.
+        Self::bump_instance_ttl(env);
         env.storage()
             .instance()
             .get(&DataKey::Commitment)

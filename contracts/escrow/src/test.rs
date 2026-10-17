@@ -623,6 +623,14 @@ mod mock_oracle {
                 .map(|(price, timestamp)| PriceData { price, timestamp })
         }
 
+        /// Simulates "this oracle does not quote that asset" for the
+        /// freshness probe — same test-only shape as the fault-injection
+        /// suite's `clear_quote`; the real oracle has no such hook (its
+        /// feed simply doesn't list the symbol).
+        pub fn clear_price(env: Env) {
+            env.storage().instance().remove(&symbol_short!("price"));
+        }
+
         /// Hardcoded to match Reflector's real fiat-exchange-rate oracle
         /// (verified live, see `reflector.rs`) -- `resolve_fx_shortfall`
         /// calls this to scale `lastprice`'s raw integer back into an
@@ -1153,6 +1161,153 @@ fn cannot_expire_fx_shortfall_window_once_funded() {
 
     let result = s.contract.try_expire_fx_shortfall_window();
     assert_eq!(result, Err(Ok(Error::FxShortfallAlreadyFunded)));
+}
+
+// ---------- refresh_fx_quote_status (#1, "waiting on a fresh quote") ----------
+
+#[test]
+fn stale_quote_leaves_no_flag_but_refresh_fx_quote_status_records_one() {
+    // The whole reason #1 needed its own probe: `resolve_fx_shortfall`'s
+    // OracleStale refusal returns `Err`, and a Soroban invocation that
+    // errors rolls back every write it made — so the refusal itself can
+    // never record why it refused. Proven here, not assumed: after the
+    // failed resolve the flag is still false, and only the separate
+    // (successful) probe persists it.
+    let (s, _oracle) = setup_with_oracle(3_600);
+    advance_to_delivered_with_shortfall(&s);
+    advance_time(&s, 3_601); // the configured quote is now stale
+
+    assert_eq!(
+        s.contract.try_resolve_fx_shortfall(),
+        Err(Ok(Error::OracleStale))
+    );
+    assert!(
+        !s.contract.get_commitment().fx_quote_stale,
+        "the failed call must have written nothing"
+    );
+
+    s.contract.refresh_fx_quote_status();
+    assert!(s.contract.get_commitment().fx_quote_stale);
+}
+
+#[test]
+fn refresh_fx_quote_status_clears_the_flag_once_a_fresh_quote_lands() {
+    let (s, oracle) = setup_with_oracle(3_600);
+    advance_to_delivered_with_shortfall(&s);
+    advance_time(&s, 3_601);
+    s.contract.refresh_fx_quote_status();
+    assert!(s.contract.get_commitment().fx_quote_stale);
+
+    // Reflector publishes a fresh quote; the next probe self-corrects —
+    // no reverse transition to learn, the flag tracks reality.
+    oracle.set_price(&175_000_000_000_000i128, &s.env.ledger().timestamp());
+    s.contract.refresh_fx_quote_status();
+    assert!(!s.contract.get_commitment().fx_quote_stale);
+}
+
+#[test]
+fn refresh_fx_quote_status_is_informational_and_gates_nothing() {
+    // The flag must not change settlement behavior in any direction. It
+    // doesn't unblock anything by itself (`settle` is still gated on
+    // `FxNotResolved`), and a normal fresh-quote resolve -> fund ->
+    // settle path runs identically with the flag having been set and
+    // cleared in between.
+    let (s, oracle) = setup_with_oracle_denomination(3_600, SHORTFALL_DENOMINATION);
+    advance_to_delivered_with_shortfall(&s);
+    advance_time(&s, 3_601);
+    s.contract.refresh_fx_quote_status();
+    assert!(s.contract.get_commitment().fx_quote_stale);
+    assert_eq!(s.contract.try_settle(), Err(Ok(Error::FxNotResolved)));
+
+    // Fresh quote: the probe clears, the shortfall path works exactly as
+    // it did before the flag existed (750_000 top-up, per the fixture's
+    // recorded figures), and settle completes.
+    oracle.set_price(&175_000_000_000_000i128, &s.env.ledger().timestamp());
+    s.contract.refresh_fx_quote_status();
+    assert!(!s.contract.get_commitment().fx_quote_stale);
+    s.contract.resolve_fx_shortfall();
+    assert_eq!(
+        s.contract.get_commitment().fx_shortfall_amount,
+        EXPECTED_SHORTFALL
+    );
+    s.contract.fund_fx_shortfall();
+    s.contract.settle();
+    assert_eq!(s.contract.get_status(), Status::Settled);
+}
+
+#[test]
+fn resolve_fx_shortfall_clears_the_flag_so_it_never_lingers_past_resolution() {
+    let (s, oracle) = setup_with_oracle(3_600);
+    advance_to_delivered_with_shortfall(&s);
+    advance_time(&s, 3_601);
+    s.contract.refresh_fx_quote_status();
+    assert!(s.contract.get_commitment().fx_quote_stale);
+
+    // Fresh quote, then resolve *without* another probe — resolution
+    // itself must clear the flag, or a commitment could sit `Settled`
+    // still advertising "waiting on a fresh quote".
+    oracle.set_price(&175_000_000_000_000i128, &s.env.ledger().timestamp());
+    s.contract.resolve_fx_shortfall();
+    assert!(!s.contract.get_commitment().fx_quote_stale);
+
+    // And there's nothing left to wait for once resolved.
+    assert_eq!(
+        s.contract.try_refresh_fx_quote_status(),
+        Err(Ok(Error::FxAlreadyResolved))
+    );
+}
+
+#[test]
+fn refresh_fx_quote_status_refuses_outside_delivered_and_without_an_oracle() {
+    // Not yet Delivered — the flag can't matter before settlement is
+    // actually pending.
+    let (s2, _oracle) = setup_with_oracle(3_600);
+    s2.contract.lock();
+    assert_eq!(
+        s2.contract.try_refresh_fx_quote_status(),
+        Err(Ok(Error::InvalidState))
+    );
+
+    // Delivered, but this commitment never needed a conversion at all.
+    let s = setup(1_500, 1_500);
+    s.contract.lock();
+    assert_eq!(
+        s.contract.try_refresh_fx_quote_status(),
+        Err(Ok(Error::InvalidState))
+    );
+    s.contract.release_advance_1();
+    s.contract.claim_advance_1();
+    s.contract.mark_checkpoint();
+    s.contract.release_advance_2();
+    s.contract.claim_advance_2();
+    s.contract.ready_for_delivery();
+    s.contract.fund_remainder();
+    s.contract
+        .confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
+    assert_eq!(
+        s.contract.try_refresh_fx_quote_status(),
+        Err(Ok(Error::OracleNotConfigured))
+    );
+    assert!(
+        !s.contract.get_commitment().fx_quote_stale,
+        "a refused call must have written nothing"
+    );
+}
+
+#[test]
+fn refresh_fx_quote_status_does_not_conflate_a_missing_quote_with_a_stale_one() {
+    // "The oracle doesn't quote this asset at all" is a permanent
+    // configuration gap, not "come back later" — waiting will never fix
+    // it, so the error propagates and the waiting flag is not set.
+    let (s, oracle) = setup_with_oracle(3_600);
+    advance_to_delivered_with_shortfall(&s);
+    oracle.clear_price();
+
+    assert_eq!(
+        s.contract.try_refresh_fx_quote_status(),
+        Err(Ok(Error::OraclePriceUnavailable))
+    );
+    assert!(!s.contract.get_commitment().fx_quote_stale);
 }
 
 // ---------- opening a tranche moves no funds ----------

@@ -71,12 +71,40 @@ jobs:
         run: cargo llvm-cov --workspace --all-targets --locked
 
   # ---------------------------------------------------------------------
-  # #111, #122, #124, #125 — four integration suites, each its own job so
-  # a failure points at the issue it guards instead of at "cargo test".
+  # #2, #111, #122, #124, #125 — five integration suites, each its own job
+  # so a failure points at the issue it guards instead of at "cargo test".
   # They are separate `--test` targets under contracts/escrow/tests/, so
   # the umbrella `test` job above also runs them; these jobs exist so the
   # signal is legible per issue and so a suite can be re-run alone.
   # ---------------------------------------------------------------------
+
+  permissionless-release-review:
+    name: "#2 permissionless release review"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Pins docs/permissionless-release-review.md's conclusions: the two
+      # tranche-opening calls need no signature, move no funds, write their
+      # clock exactly once, and empower nobody — including the issue's
+      # end-to-end third-party griefing scenario.
+      - name: cargo test --test permissionless_release_review
+        working-directory: contracts/escrow
+        run: cargo test --test permissionless_release_review --verbose
 
   deadline-boundary:
     name: "#111 deadline boundary tests"

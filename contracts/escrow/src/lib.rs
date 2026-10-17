@@ -1073,6 +1073,12 @@ impl EscrowContract {
     /// via `Self::save` upon state transition to `Status::Delivered`. No
     /// redundant reads or writes occur across the quantity/grade calculation
     /// or final state-write.
+    ///
+    /// # Panics
+    ///
+    /// The checked conversions panic if either derived basis-point value
+    /// exceeds `u32`; validated quantity and grade bounds keep both values
+    /// within 10,000.
     pub fn confirm_delivery(
         env: Env,
         delivered_quantity: u32,
@@ -1090,11 +1096,15 @@ impl EscrowContract {
         };
         c.warehouse_operator.require_auth();
 
-        let quantity_bps = (delivered_quantity.min(c.contracted_quantity) as i128 * 10_000
-            / c.contracted_quantity as i128) as u32;
+        let quantity_bps = u32::try_from(
+            i128::from(delivered_quantity.min(c.contracted_quantity)) * 10_000
+                / i128::from(c.contracted_quantity),
+        )
+        .expect("quantity basis points are bounded by 10,000");
         c.delivered_quantity = delivered_quantity;
         c.grade_index = grade_index;
-        c.settlement_bps = (quantity_bps as i128 * grade_bps as i128 / 10_000) as u32;
+        c.settlement_bps = u32::try_from(i128::from(quantity_bps) * i128::from(grade_bps) / 10_000)
+            .expect("settlement basis points are bounded by 10,000");
         Self::set_status(&env, &mut c, Status::Delivered);
         Self::save(&env, &c);
         Ok(())
@@ -1627,7 +1637,7 @@ impl EscrowContract {
     }
 
     fn bps_amount(total: i128, bps: u32) -> i128 {
-        total * (bps as i128) / 10_000
+        total * i128::from(bps) / 10_000
     }
 
     /// Calls `require_auth()` once per distinct address, in first-seen order.

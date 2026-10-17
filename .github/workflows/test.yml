@@ -8,8 +8,8 @@ on:
 # Explicit least-privilege token, not relying on the repo/org default
 # (currently "read" too, checked directly -- but shouldn't depend on
 # that staying true). No job pushes, comments, or writes anything --
-# checkout, the static guard scripts, cargo test, and stellar contract
-# build all only need read access.
+# checkout, the static guard scripts, cargo test, Clippy, and the stellar
+# contract build all only need read access.
 permissions:
   contents: read
 

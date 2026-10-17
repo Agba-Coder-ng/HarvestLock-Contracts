@@ -10,8 +10,11 @@
 //! Fault modes covered: no config, no quote on record, stale quote, quote at
 //! exactly the bound, a crashed (`panic!`ing) callee, an unreachable callee
 //! (address with no contract deployed), a future-dated quote, a negative
-//! price, a price large enough to overflow the conversion multiply, and an
-//! absurd `decimals()`.
+//! price, a price large enough to overflow the conversion multiply, an
+//! absurd `decimals()`, and (#63) a *plausible* change to `decimals()`, which
+//! is silently accepted rather than trapping — see
+//! `docs/reflector-decimals-assumption.md` for why the contract assumes the
+//! scale never changes and what happens if it does.
 //!
 //! ## Findings this harness produced (all real, all reproducible)
 //!
@@ -70,9 +73,7 @@ const DENOMINATED: i128 = 500_000;
 /// cross-contract calls on XDR shape, not Rust type identity), plus three
 /// test-only setup hooks the real Reflector contract does not have.
 mod faulty_oracle {
-    use soroban_sdk::{
-        contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
-    };
+    use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
 
     #[contracttype]
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,7 +172,7 @@ fn oracle_world(max_age_secs: u64, denominated_amount: i128) -> OracleWorld {
     let oracle_id = env.register(faulty_oracle::FaultyOracle, ());
     let oracle = faulty_oracle::FaultyOracleClient::new(&env, &oracle_id);
     oracle.set_quote(&FRESH_PRICE, &env.ledger().timestamp());
-    let w = build_with(env.clone(), oracle_id.clone(), max_age_secs, denominated_amount);
+    let w = build_with(env, oracle_id.clone(), max_age_secs, denominated_amount);
     OracleWorld {
         w,
         oracle_addr: oracle_id,
@@ -185,7 +186,7 @@ fn oracle_world_unreachable(max_age_secs: u64, denominated_amount: i128) -> Orac
     env.mock_all_auths();
     // Generated, funded-looking, and deliberately *never registered*.
     let dangling = Address::generate(&env);
-    let w = build_with(env.clone(), dangling.clone(), max_age_secs, denominated_amount);
+    let w = build_with(env, dangling.clone(), max_age_secs, denominated_amount);
     OracleWorld {
         w,
         oracle_addr: dangling,
@@ -274,7 +275,10 @@ fn no_oracle_configured_degrades_to_oracle_not_configured_on_both_read_paths() {
     // `Error::OracleNotConfigured` used to name only `oracle_rate` even
     // though `resolve_fx_shortfall` returns it too (fixed in this PR).
     let s = world(1_500, 1_500);
-    assert_eq!(s.contract.try_oracle_rate(), Err(Ok(Error::OracleNotConfigured)));
+    assert_eq!(
+        s.contract.try_oracle_rate(),
+        Err(Ok(Error::OracleNotConfigured))
+    );
     assert_eq!(s.contract.get_oracle_config(), None);
 
     // The settlement path degrades identically, and nothing is recorded.
@@ -324,10 +328,7 @@ fn stale_quote_degrades_to_oracle_stale_on_both_read_paths() {
     let s = oracle_world(MAX_AGE, DENOMINATED);
     s.w.advance(MAX_AGE + 1);
 
-    assert_eq!(
-        s.w.contract.try_oracle_rate(),
-        Err(Ok(Error::OracleStale))
-    );
+    assert_eq!(s.w.contract.try_oracle_rate(), Err(Ok(Error::OracleStale)));
 
     s.w.drive_to_delivered();
     assert_eq!(
@@ -420,10 +421,7 @@ fn a_future_dated_quote_bypasses_the_staleness_bound_for_as_long_as_it_stays_ahe
     // The bypass lasts exactly as long as the ledger stays behind the stamp —
     // once real time passes it, normal staleness applies again.
     s.w.advance(10_000 + MAX_AGE + 1);
-    assert_eq!(
-        s.w.contract.try_oracle_rate(),
-        Err(Ok(Error::OracleStale))
-    );
+    assert_eq!(s.w.contract.try_oracle_rate(), Err(Ok(Error::OracleStale)));
 
     // The sharp version of the finding: nothing bounds how far ahead a quote
     // may be stamped, so a feed (or a compromised one) that always reports a
@@ -494,7 +492,10 @@ fn an_overflowing_price_traps_resolve_fx_shortfall_without_recording_anything() 
     );
 
     let c = s.w.contract.get_commitment();
-    assert!(!c.fx_resolved, "and Soroban's atomicity left no partial write");
+    assert!(
+        !c.fx_resolved,
+        "and Soroban's atomicity left no partial write"
+    );
     assert_eq!(c.fx_adjusted_total, 0);
     assert_eq!(s.w.status(), Status::Delivered);
 }
@@ -518,6 +519,57 @@ fn an_absurd_decimals_count_traps_resolve_fx_shortfall() {
     assert!(!s.w.contract.get_commitment().fx_resolved);
 }
 
+/// #63 — the decimals-change question, and the assumption the conversion leans
+/// on. See `docs/reflector-decimals-assumption.md` for the full finding.
+///
+/// `oracle_rate()` does **no** conversion math: it returns the raw `price`
+/// exactly as `lastprice` gave it and never calls `decimals()`, so a
+/// `decimals()` change cannot alter it. The scale is applied in exactly one
+/// place — `resolve_fx_shortfall` (`lib.rs`), via `10i128.pow(decimals)`.
+///
+/// Reflector's real contract makes `decimals` immutable: `settings.rs` writes
+/// it once in `init` (which aborts with `AlreadyInitialized` on a second call)
+/// and exposes no `set_decimals`, and SEP-40 says the value "should never
+/// change." This test pins what happens if that invariant is ever violated
+/// anyway: a *plausible* new value (15 instead of 14) is accepted silently and
+/// rescales the conversion by a power of ten, with no error and no mismatch
+/// detection — unlike the absurd value in the F5 test above, which traps.
+#[test]
+fn a_plausible_decimals_change_silently_rescales_resolve_fx_shortfall() {
+    let s = oracle_world(MAX_AGE, 1_000_000);
+    s.oracle().set_quote(&FRESH_PRICE, &s.w.now());
+
+    // At the real oracle's 14 decimals: 1_000_000 * 175_000_000_000_000 /
+    // 10^14 == 1_750_000.
+    assert_eq!(
+        s.w.contract.oracle_rate().price,
+        FRESH_PRICE,
+        "oracle_rate returns the raw, unscaled price"
+    );
+
+    // A plausible precision bump — one more decimal place, still well within
+    // i128 so nothing overflows.
+    s.oracle().set_decimals(&15);
+
+    // `oracle_rate()` is untouched: it never reads `decimals()`.
+    assert_eq!(s.w.contract.oracle_rate().price, FRESH_PRICE);
+
+    s.w.drive_to_delivered();
+    s.w.contract.resolve_fx_shortfall();
+
+    let c = s.w.contract.get_commitment();
+    assert!(
+        c.fx_resolved,
+        "FINDING (#63): no error, no mismatch check — the changed scale is \
+         accepted silently"
+    );
+    assert_eq!(
+        c.fx_adjusted_total, 175_000,
+        "FINDING (#63): the same raw price at decimals = 15 converts to \
+         10^(14 - 15) == 1/10th the value, and nothing flags it"
+    );
+}
+
 /// A healthy oracle still behaves normally after every fault above has been
 /// driven at a *different* instance — i.e. none of this is state leakage
 /// between commitments, and the harness itself is not accidentally asserting
@@ -537,7 +589,10 @@ fn a_healthy_quote_still_resolves_normally_after_the_fault_modes() {
     let fresh_id = env.register(faulty_oracle::FaultyOracle, ());
     let fresh = faulty_oracle::FaultyOracleClient::new(&env, &fresh_id);
     fresh.set_quote(&FRESH_PRICE, &env.ledger().timestamp());
-    assert_eq!(fresh.lastprice(&asset_ngn(&env)).unwrap().price, FRESH_PRICE);
+    assert_eq!(
+        fresh.lastprice(&asset_ngn(&env)).unwrap().price,
+        FRESH_PRICE
+    );
 }
 
 fn asset_ngn(env: &Env) -> faulty_oracle::Asset {

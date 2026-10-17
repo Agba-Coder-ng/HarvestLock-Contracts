@@ -74,9 +74,7 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")
 /// and never ages, so a snapshot's expectation is about the contract's math,
 /// not about the simulated feed.
 mod fixture_oracle {
-    use soroban_sdk::{
-        contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
-    };
+    use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
 
     #[contracttype]
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,7 +99,9 @@ mod fixture_oracle {
             env.storage()
                 .instance()
                 .set(&symbol_short!("quote"), &(price, timestamp));
-            env.storage().instance().set(&symbol_short!("dec"), &decimals);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("dec"), &decimals);
         }
         pub fn lastprice(env: Env, _asset: Asset) -> Option<PriceData> {
             env.storage()
@@ -110,7 +110,10 @@ mod fixture_oracle {
                 .map(|(price, timestamp)| PriceData { price, timestamp })
         }
         pub fn decimals(env: Env) -> u32 {
-            env.storage().instance().get(&symbol_short!("dec")).unwrap_or(14)
+            env.storage()
+                .instance()
+                .get(&symbol_short!("dec"))
+                .unwrap_or(14)
         }
     }
 }
@@ -136,7 +139,7 @@ struct Terms {
 
 impl Default for Terms {
     fn default() -> Self {
-        Terms {
+        Self {
             total_amount: 1_000_000,
             advance1_bps: 1_500,
             advance2_bps: 1_500,
@@ -224,7 +227,10 @@ fn err_name(name: &str) -> Error {
         ("RemainderWindowPassed", Error::RemainderWindowPassed),
         ("RemainderWindowNotPassed", Error::RemainderWindowNotPassed),
         ("RemainderNotFunded", Error::RemainderNotFunded),
-        ("DeliveryDeadlineNotPassed", Error::DeliveryDeadlineNotPassed),
+        (
+            "DeliveryDeadlineNotPassed",
+            Error::DeliveryDeadlineNotPassed,
+        ),
         ("InvalidQuantity", Error::InvalidQuantity),
         ("InvalidGradeSchedule", Error::InvalidGradeSchedule),
         ("InvalidGradeIndex", Error::InvalidGradeIndex),
@@ -241,15 +247,17 @@ fn err_name(name: &str) -> Error {
         ("NoFxShortfall", Error::NoFxShortfall),
         ("FxShortfallAlreadyFunded", Error::FxShortfallAlreadyFunded),
         ("FxShortfallWindowPassed", Error::FxShortfallWindowPassed),
-        ("FxShortfallWindowNotPassed", Error::FxShortfallWindowNotPassed),
+        (
+            "FxShortfallWindowNotPassed",
+            Error::FxShortfallWindowNotPassed,
+        ),
         ("NotAParty", Error::NotAParty),
         ("DisputeWindowNotPassed", Error::DisputeWindowNotPassed),
     ];
-    table
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, e)| *e)
-        .unwrap_or_else(|| panic!("fixture references unknown Error variant `{name}`"))
+    table.iter().find(|(n, _)| *n == name).map_or_else(
+        || panic!("fixture references unknown Error variant `{name}`"),
+        |(_, e)| *e,
+    )
 }
 
 fn status_name(name: &str) -> Status {
@@ -267,11 +275,10 @@ fn status_name(name: &str) -> Status {
         ("Forfeited", Status::Forfeited),
         ("Disputed", Status::Disputed),
     ];
-    table
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, s)| *s)
-        .unwrap_or_else(|| panic!("fixture references unknown Status variant `{name}`"))
+    table.iter().find(|(n, _)| *n == name).map_or_else(
+        || panic!("fixture references unknown Status variant `{name}`"),
+        |(_, s)| *s,
+    )
 }
 
 /// The whole fixture directory, parsed. Any parse failure panics with the
@@ -295,7 +302,8 @@ fn load_snapshots() -> Vec<Snapshot> {
 
 fn load_snapshot(path: &Path) -> Snapshot {
     let file = path.file_name().unwrap().to_string_lossy().to_string();
-    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let text =
+        fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
 
     let mut terms = Terms::default();
     let mut grade_bps: Option<Vec<u32>> = None;
@@ -320,7 +328,11 @@ fn load_snapshot(path: &Path) -> Snapshot {
             continue;
         }
         let Some((key, value)) = trimmed.split_once('=') else {
-            parse_error(&file, line, &format!("expected `key = value`, got `{trimmed}`"));
+            parse_error(
+                &file,
+                line,
+                &format!("expected `key = value`, got `{trimmed}`"),
+            );
         };
         let key = key.trim();
         let value = value.trim();
@@ -382,10 +394,7 @@ fn load_snapshot(path: &Path) -> Snapshot {
                 // call and arguments.
                 let (call, args, expectation) = parse_step_value(value, &file, line);
                 let signature = signature_of(&call, &args);
-                if pending
-                    .replace((signature, expectation, line))
-                    .is_some()
-                {
+                if pending.replace((signature, expectation, line)).is_some() {
                     parse_error(
                         &file,
                         line,
@@ -453,7 +462,10 @@ fn parse_step_value(value: &str, file: &str, line: usize) -> (String, Vec<String
         Some((lhs, expect)) => (lhs, Some(expect.trim())),
         None => (value, None),
     };
-    let mut tokens = lhs.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+    let mut tokens = lhs
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     if tokens.is_empty() {
         parse_error(file, line, "step has no call name");
     }
@@ -503,7 +515,9 @@ fn num<T>(s: &str, file: &str, line: usize) -> T
 where
     T: std::str::FromStr,
 {
-    s.trim().parse().unwrap_or_else(|_| parse_error(file, line, &format!("`{s}` is not a number")))
+    s.trim()
+        .parse()
+        .unwrap_or_else(|_| parse_error(file, line, &format!("`{s}` is not a number")))
 }
 
 // ---------- the replay engine ----------
@@ -551,7 +565,12 @@ fn party_of(s: &str) -> Party {
 fn hex_to_32(s: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     let b = s.as_bytes();
-    assert_eq!(b.len(), 64, "member_hash must be 64 hex chars, got {}", b.len());
+    assert_eq!(
+        b.len(),
+        64,
+        "member_hash must be 64 hex chars, got {}",
+        b.len()
+    );
     for i in 0..32 {
         let digit = |c: u8| {
             char::from(c)
@@ -560,7 +579,7 @@ fn hex_to_32(s: &str) -> [u8; 32] {
         };
         let hi = digit(b[i * 2]);
         let lo = digit(b[i * 2 + 1]);
-        out[i] = ((hi << 4) | lo) as u8;
+        out[i] = u8::try_from((hi << 4) | lo).expect("two hexadecimal digits fit in one byte");
     }
     out
 }
@@ -581,21 +600,24 @@ fn build(snap: &Snapshot) -> Scene {
     let token = token::Client::new(&env, &token_address);
     token::StellarAssetClient::new(&env, &token_address).mint(&buyer, &snap.terms.buyer_mint);
 
-    let mut oracle_config = None;
-    if let Some((symbol, denominated, max_age, price, decimals)) = &snap.terms.oracle {
-        let id = env.register(fixture_oracle::FixtureOracle, ());
-        fixture_oracle::FixtureOracleClient::new(&env, &id).set_quote(
-            price,
-            &env.ledger().timestamp(),
-            decimals,
-        );
-        oracle_config = Some(OracleConfig {
-            oracle_contract: id,
-            price_asset: Symbol::new(&env, symbol),
-            max_age_secs: *max_age,
-            denominated_amount: *denominated,
-        });
-    }
+    let oracle_config =
+        snap.terms
+            .oracle
+            .as_ref()
+            .map(|(symbol, denominated, max_age, price, decimals)| {
+                let id = env.register(fixture_oracle::FixtureOracle, ());
+                fixture_oracle::FixtureOracleClient::new(&env, &id).set_quote(
+                    price,
+                    &env.ledger().timestamp(),
+                    decimals,
+                );
+                OracleConfig {
+                    oracle_contract: id,
+                    price_asset: Symbol::new(&env, symbol),
+                    max_age_secs: *max_age,
+                    denominated_amount: *denominated,
+                }
+            });
 
     let mut grade_schedule = OnChainVec::<u32>::new(&env);
     for g in &snap.terms.grade_price_bps {
@@ -655,10 +677,12 @@ enum Outcome {
 fn run_step(scene: &Scene, step: &Step) -> Outcome {
     let c = &scene.contract;
     let a = |i: usize| -> String {
-        step.args
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| panic!("{}:{} `{}` needs more arguments", step.file, step.line, step.call))
+        step.args.get(i).cloned().unwrap_or_else(|| {
+            panic!(
+                "{}:{} `{}` needs more arguments",
+                step.file, step.line, step.call
+            )
+        })
     };
     let qty = |i: usize| -> u32 { num(&a(i), &step.file, step.line) };
 
@@ -699,9 +723,12 @@ fn run_step(scene: &Scene, step: &Step) -> Outcome {
             let env = &scene.env;
             let mut members = OnChainVec::<AllocationMember>::new(env);
             for spec in &step.args {
-                let (hash, bps) = spec
-                    .split_once(':')
-                    .unwrap_or_else(|| panic!("{}:{} bad allocation member `{spec}` (want hex:bps)", step.file, step.line));
+                let (hash, bps) = spec.split_once(':').unwrap_or_else(|| {
+                    panic!(
+                        "{}:{} bad allocation member `{spec}` (want hex:bps)",
+                        step.file, step.line
+                    )
+                });
                 let bytes = hex_to_32(hash);
                 members.push_back(AllocationMember {
                     member_hash: BytesN::from_array(env, &bytes),
@@ -776,7 +803,7 @@ fn check_value(scene: &Scene, key: &str, want: &str) -> Result<(), String> {
         "buyer_balance" => eq_i128(balance(&scene.buyer)),
         "contract_balance" => eq_i128(balance(&contract_address)),
         "stranger_balance" => eq_i128(balance(&scene.stranger)),
-        "settlement_bps" => eq_i128(c.settlement_bps as i128),
+        "settlement_bps" => eq_i128(i128::from(c.settlement_bps)),
         "fx_adjusted_total" => eq_i128(c.fx_adjusted_total),
         "fx_shortfall_amount" => eq_i128(c.fx_shortfall_amount),
         "fx_resolved" => eq_bool(c.fx_resolved),
@@ -793,7 +820,7 @@ fn check_value(scene: &Scene, key: &str, want: &str) -> Result<(), String> {
                 Err(format!("expected {want}, got {:?}", c.dispute_pre_status))
             }
         }
-        "delivered_quantity" => eq_i128(c.delivered_quantity as i128),
+        "delivered_quantity" => eq_i128(i128::from(c.delivered_quantity)),
         "buyer_party" => {
             if c.buyer == scene.addr(party_of(want)) {
                 Ok(())
@@ -802,7 +829,7 @@ fn check_value(scene: &Scene, key: &str, want: &str) -> Result<(), String> {
             }
         }
         "allocation_count" => match scene.contract.try_get_allocation() {
-            Ok(Ok(v)) => eq_i128(v.len() as i128),
+            Ok(Ok(v)) => eq_i128(i128::from(v.len())),
             Ok(Err(c)) => Err(format!("could not decode get_allocation's return: {c:?}")),
             Err(Ok(e)) => Err(format!("get_allocation returned {e:?}")),
             Err(Err(_)) => Err("get_allocation aborted at the host level".to_string()),
@@ -821,12 +848,7 @@ fn replay(snap: &Snapshot) -> Vec<String> {
     let mut divergences = Vec::new();
     for step in &snap.steps {
         let outcome = run_step(&scene, step);
-        let step_text = format!(
-            "{}:{} step `{}`",
-            step.file,
-            step.line,
-            step.signature()
-        );
+        let step_text = format!("{}:{} step `{}`", step.file, step.line, step.signature());
         match &step.current {
             // A declared divergence: today's build must do exactly what the
             // fixture says it does, and must *not* still do what the chain
@@ -935,10 +957,7 @@ fn replay_all_recorded_snapshots() {
 /// deleted the annotation — this names it instead of going quiet.
 #[test]
 fn the_recorded_divergences_are_still_divergences() {
-    let found: Vec<String> = load_snapshots()
-        .iter()
-        .flat_map(replay)
-        .collect();
+    let found: Vec<String> = load_snapshots().iter().flat_map(replay).collect();
     for expected in [
         // The status gate now fires before the tranche gate, so an out-of-order
         // `settle` reports a different error than the one read off the chain.
@@ -982,7 +1001,11 @@ fn fixtures_are_present_named_and_sourced() {
         snapshots.len()
     );
     for s in &snapshots {
-        assert!(!s.name.is_empty(), "{} has no `snapshot =` name", s.path.display());
+        assert!(
+            !s.name.is_empty(),
+            "{} has no `snapshot =` name",
+            s.path.display()
+        );
         assert!(
             s.provenance.contains("HANDOFF.md"),
             "{}'s provenance must cite HANDOFF.md's deployment history (it says: {})",

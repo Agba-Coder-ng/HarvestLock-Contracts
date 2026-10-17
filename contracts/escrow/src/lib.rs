@@ -330,6 +330,11 @@ pub struct OracleConfig {
     /// of the multiplication is what lets `resolve_fx_shortfall`'s
     /// conversion formula skip a separate unit-normalization step — see
     /// its doc comment for the worked example.
+    ///
+    /// **Not** the oracle's `decimals()` — that is a property of the
+    /// oracle, read live at settlement and assumed immutable (see
+    /// `docs/reflector-decimals-assumption.md`, issue #63); this field is
+    /// the deal's value in the same 7-decimal units as `total_amount`.
     pub denominated_amount: i128,
 }
 
@@ -1111,33 +1116,11 @@ impl EscrowContract {
     /// redundant reads or writes occur across the quantity/grade calculation
     /// or final state-write.
     ///
-    /// **Atomicity review of the `grade_index` bounds check (#95)** — the
-    /// exact order of operations, traced from the code, is: `load` (read
-    /// only) → status guard → `remainder_funded` guard → the `grade_index`
-    /// bounds check against `grade_price_bps` → `warehouse_operator
-    /// .require_auth()` → in-memory mutation of the local copy → a single
-    /// `save`. The bounds check therefore runs **before any state
-    /// mutation** — and before auth is consumed — so an out-of-range grade
-    /// rejects with `InvalidGradeIndex` and nothing was ever written: there
-    /// is no partially-updated commitment for this function to leave
-    /// behind, today or via the obvious refactor mistake (mutate-then-check)
-    /// landing unnoticed, for two independent reasons: (1) all mutations
-    /// touch only the in-memory `c` and the sole storage write sits after
-    /// every guard, and (2) even if a guard *were* reordered after `save`,
-    /// a Soroban invocation that returns an error has its entire ledger
-    /// footprint rolled back by the host — instance-storage writes and
-    /// published events alike — so the failure would still leave the prior
-    /// `Commitment` intact. Soroban's rollback alone would make this safe
-    /// by construction; the current check-before-mutate ordering is kept
-    /// because it additionally fails before burning the warehouse
-    /// operator's auth and keeps the effects-before-interactions invariant
-    /// (the only external call sites in this contract are token transfers,
-    /// and this function does none) honest rather than load-bearing. This
-    /// is a recorded conclusion, not an assumption — and it is why #95
-    /// adds no new test: the ordering has no gap to cover, and the
-    /// rejection itself is already pinned by
-    /// `confirm_delivery_rejects_an_out_of_range_grade_index`, which
-    /// asserts both the error and the untouched stored state.
+    /// # Panics
+    ///
+    /// The checked conversions panic if either derived basis-point value
+    /// exceeds `u32`; validated quantity and grade bounds keep both values
+    /// within 10,000.
     pub fn confirm_delivery(
         env: Env,
         delivered_quantity: u32,
@@ -1155,11 +1138,15 @@ impl EscrowContract {
         };
         c.warehouse_operator.require_auth();
 
-        let quantity_bps = (delivered_quantity.min(c.contracted_quantity) as i128 * 10_000
-            / c.contracted_quantity as i128) as u32;
+        let quantity_bps = u32::try_from(
+            i128::from(delivered_quantity.min(c.contracted_quantity)) * 10_000
+                / i128::from(c.contracted_quantity),
+        )
+        .expect("quantity basis points are bounded by 10,000");
         c.delivered_quantity = delivered_quantity;
         c.grade_index = grade_index;
-        c.settlement_bps = (quantity_bps as i128 * grade_bps as i128 / 10_000) as u32;
+        c.settlement_bps = u32::try_from(i128::from(quantity_bps) * i128::from(grade_bps) / 10_000)
+            .expect("settlement basis points are bounded by 10,000");
         Self::set_status(&env, &mut c, Status::Delivered);
         Self::save(&env, &c);
         Ok(())
@@ -1255,7 +1242,11 @@ impl EscrowContract {
         let buyer_refund = remainder_balance - coop_payment;
 
         if coop_payment > 0 {
-            token_client.transfer(&env.current_contract_address(), &c.cooperative, &coop_payment);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &c.cooperative,
+                &coop_payment,
+            );
         }
         if buyer_refund > 0 {
             token_client.transfer(&env.current_contract_address(), &c.buyer, &buyer_refund);
@@ -1283,6 +1274,17 @@ impl EscrowContract {
     /// assuming a slightly better rate, escrow might hold only
     /// 6_500_000_000 (650 USDC) — a genuine 17 USDC shortfall the buyer
     /// now owes, exactly the FX-risk gap PRD §4.2 names.
+    ///
+    /// **The `decimals` divisor is trusted to be constant** (#63): it is read
+    /// live from the oracle rather than pinned in `OracleConfig`, because it
+    /// is a property of the oracle, not the commitment. Reflector's real
+    /// contract makes `decimals` immutable (write-once at `config`, no
+    /// setter; SEP-40 likewise says it "should never change"), so the trust
+    /// is well-placed for the deployed oracle. If it were ever violated the
+    /// conversion would silently rescale by a power of ten rather than
+    /// error — see `docs/reflector-decimals-assumption.md` and the
+    /// `a_plausible_decimals_change_silently_rescales_resolve_fx_shortfall`
+    /// test that pins it.
     ///
     /// Requires both tranches already resolved (same guard `settle`
     /// itself has) before reading `claimed_by_coop` — computing this
@@ -1328,7 +1330,8 @@ impl EscrowContract {
             0
         });
         let owed_from_remainder = (fx_adjusted_total - claimed_by_coop).max(0);
-        let available_balance = token::Client::new(&env, &c.token).balance(&env.current_contract_address());
+        let available_balance =
+            token::Client::new(&env, &c.token).balance(&env.current_contract_address());
         let shortfall = (owed_from_remainder - available_balance).max(0);
 
         c.fx_adjusted_total = fx_adjusted_total;
@@ -1379,7 +1382,11 @@ impl EscrowContract {
         c.fx_shortfall_funded = true;
         Self::save(&env, &c);
 
-        token::Client::new(&env, &c.token).transfer(&c.buyer, env.current_contract_address(), &amount);
+        token::Client::new(&env, &c.token).transfer(
+            &c.buyer,
+            env.current_contract_address(),
+            &amount,
+        );
         Ok(())
     }
 
@@ -1712,7 +1719,7 @@ impl EscrowContract {
     }
 
     fn bps_amount(total: i128, bps: u32) -> i128 {
-        total * (bps as i128) / 10_000
+        total * i128::from(bps) / 10_000
     }
 
     /// Calls `require_auth()` once per distinct address, in first-seen order.

@@ -842,47 +842,30 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 17 Oct 2026 — issues #95–#98 review set: one real
-contract-behavior fix (instance TTL), three documentation conclusions, one
-new end-to-end test, two new TTL tests. 191 → 194 tests, all passing.
-**#95**: traced `confirm_delivery` before assuming anything — the
-`grade_index` bounds check runs against storage state *before* any
-mutation, auth comes next, and exactly one `save` follows; a rejected
-index can never be persisted, and even a hypothetical refactored ordering
-is covered by Soroban's whole-transaction rollback. No gap, no new test —
-the existing `confirm_delivery_rejects_an_out_of_range_grade_index` pins
-the rejection, extended in this session to also assert the stored
-commitment stays untouched after it; the trace conclusion now lives in
-the function's doc comment. **#96**: `lock` is the first and only place funds move — an
-abandoned `Draft` commitment holds **zero** funds (its token balance is
-provably zero), `cancel` from `Draft` refunds nothing to anyone, and
-`reclaim_on_nondelivery` deliberately rejects `Draft`; the only residue is
-the storage entry, whose lifetime is #98's subject. Written into
-`initialize`'s doc comment. **#97**: `docs/minimal-example.md` — the
-smallest legal `initialize` (single-entry grade schedule,
-`oracle_config = None`) walked through every call to `settle` with
-balances at each step; the issue pointed at `api/test/stellar.test.ts`,
-which lives in the sibling `api/` app repo, not this one, so the
-walkthrough is instead pinned by
-`minimal_commitment_walkthrough_settles_end_to_end` in `src/test.rs`
-(local test host, no testnet deploy — none was needed and this session
-holds no funded network keys). **#98**: genuine gap, fixed — the contract
-had **zero** `extend_ttl` calls and Soroban does not auto-extend on
-invocation, while all three `DataKey` variants share the one instance
-storage entry and one TTL; a commitment dormant past `max_entry_ttl`
-archives mid-lifecycle. New private `bump_instance_ttl` (called from
-`load()` and `initialize()`, extends when remaining TTL < max/2, so
-active commitments re-rent amortized rather than per-call; the host bumps
-the WASM code entry with the instance) closes it for any commitment
-touched at least once per max-TTL window; the zero-touch residual and its
-off-chain mitigations (`stellar contract extend`/`restore`, read-path
-keeper) are written up in `docs/storage-ttl.md` with the per-entry audit.
-Two tests pin the mechanics empirically
-(`dormant_instance_is_rescued_by_the_first_call`,
-`locked_commitment_survives_long_dormancy_via_read_path_ttl_bumps`).
-No error variants added, so the discriminant and auth-doc guard scripts
-pass unchanged. Snapshots for the three new tests deliberately **not
-committed** — same record-only reasoning as the prior entry below.*
+*Last updated: 17 Oct 2026 — #63, the Reflector `decimals()` question:
+documented finding plus one test, no contract behavior changed. `oracle_rate()`
+performs *no* conversion math — it returns the raw `price` from `lastprice`
+and never calls the oracle's `decimals()` — so a change to Reflector's
+`decimals()` cannot affect it; the issue's "oracle_rate()'s conversion math"
+is a slight misattribution. The only place `decimals()` enters the math is
+`resolve_fx_shortfall`'s `10i128.pow(decimals)` divisor, read live per
+settlement. The contract's implicit assumption — that `decimals()` is
+immutable — is now verified rather than assumed: Reflector's real contract
+(`oracle/src/settings.rs`) writes `decimals` once in `init`, which aborts with
+`AlreadyInitialized` on a second call, and exposes no `set_decimals`; SEP-40
+states the value "should never change"; Reflector's own integration docs say
+the same. New `docs/reflector-decimals-assumption.md` records the finding in
+full. New test
+`a_plausible_decimals_change_silently_rescales_resolve_fx_shortfall`
+(`tests/oracle_fault_injection.rs`) pins the behavior if the invariant is ever
+violated: a *plausible* new scale (15 vs 14) is accepted with no error and
+silently rescales the conversion by a power of ten, whereas the separate F5
+finding covers an absurd value that *traps* instead. Doc comments in
+`reflector.rs` and `lib.rs` (`OracleConfig`, `resolve_fx_shortfall`) now state
+the assumption instead of leaving it implicit. 156 lib tests unchanged;
+`oracle_fault_injection` 12 → 13 (192 total). No contract code path changed.
+Snapshots for the new test deliberately **not committed** — same record-only
+reasoning as below.
 
 Prior entry: 16 Oct 2026 (night) — exact-deadline boundary coverage for all
 four absolute deadlines (#112–#115): tests only, plus doc-comment corrections,

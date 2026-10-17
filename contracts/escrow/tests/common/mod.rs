@@ -121,7 +121,7 @@ impl World {
     /// `total_amount * bps / 10_000`, mirroring the contract's internal
     /// `bps_amount` so money assertions read plainly.
     pub fn bps(&self, bps: u32) -> i128 {
-        self.total_amount * (bps as i128) / 10_000
+        self.total_amount * i128::from(bps) / 10_000
     }
 
     /// Locked, tranche 1 released: `advance1_deadline` is now set.
@@ -164,8 +164,7 @@ impl World {
     /// need in order to reach the oracle read at all.
     pub fn drive_to_delivered(&self) {
         self.drive_to_remainder_funded();
-        self.contract
-            .confirm_delivery(&CONTRACTED_QUANTITY, &0);
+        self.contract.confirm_delivery(&CONTRACTED_QUANTITY, &0);
     }
 }
 

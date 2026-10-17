@@ -823,26 +823,30 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 17 Oct 2026 — #62, the mutation-testing spike
-(cargo-mutants): one full run against `0f201c3` — 219 mutants in 41 min on
-2 vCPU: 197 caught, 14 survived, 8 unviable (93.4% of the runnable mutants
-killed), recorded in full in [`docs/mutation-testing.md`](./docs/mutation-testing.md).
-Three of the fourteen survivors were real gaps, and both gaps were *masked*
-rather than missing: `initialize`'s `advance1_bps + advance2_bps > 10_000`
-guard only ever had the reject side tested (nothing initializes with a sum of
-exactly 10_000, so `>=` would have silently rejected a legal 100%-advance
-deal), and `resolve_fx_shortfall`'s two identical tranche guards answered for
-each other because the sole negative test leaves *both* tranches open. Two new
-tests kill all three mutants, each verified by applying the mutant and
-watching the new test fail rather than by trusting a green suite. The other
-eleven survivors are equivalent mutants: ten `amount > 0` guards around token
-transfers (a zero-amount transfer moves no balance any client can read), and
-`settle`'s FX guard, whose `amount == 0 && !funded` pair is unreachable by
-`resolve_fx_shortfall`'s own construction — which its comment already says. CI
-now runs `cargo mutants --in-diff` over the Rust lines a PR changes
-(`test.yml`), deliberately *not* the full run (41 min here) and deliberately
-not added to `REQUIRED_CHECKS`, which is maintainer-managed; `mutants.out/`
-is gitignored. No contract code changed.
+*Last updated: 17 Oct 2026 — #63, the Reflector `decimals()` question:
+documented finding plus one test, no contract behavior changed. `oracle_rate()`
+performs *no* conversion math — it returns the raw `price` from `lastprice`
+and never calls the oracle's `decimals()` — so a change to Reflector's
+`decimals()` cannot affect it; the issue's "oracle_rate()'s conversion math"
+is a slight misattribution. The only place `decimals()` enters the math is
+`resolve_fx_shortfall`'s `10i128.pow(decimals)` divisor, read live per
+settlement. The contract's implicit assumption — that `decimals()` is
+immutable — is now verified rather than assumed: Reflector's real contract
+(`oracle/src/settings.rs`) writes `decimals` once in `init`, which aborts with
+`AlreadyInitialized` on a second call, and exposes no `set_decimals`; SEP-40
+states the value "should never change"; Reflector's own integration docs say
+the same. New `docs/reflector-decimals-assumption.md` records the finding in
+full. New test
+`a_plausible_decimals_change_silently_rescales_resolve_fx_shortfall`
+(`tests/oracle_fault_injection.rs`) pins the behavior if the invariant is ever
+violated: a *plausible* new scale (15 vs 14) is accepted with no error and
+silently rescales the conversion by a power of ten, whereas the separate F5
+finding covers an absurd value that *traps* instead. Doc comments in
+`reflector.rs` and `lib.rs` (`OracleConfig`, `resolve_fx_shortfall`) now state
+the assumption instead of leaving it implicit. 156 lib tests unchanged;
+`oracle_fault_injection` 12 → 13 (192 total). No contract code path changed.
+Snapshots for the new test deliberately **not committed** — same record-only
+reasoning as below.
 
 Prior entry: 16 Oct 2026 (night) — exact-deadline boundary coverage for all
 four absolute deadlines (#112–#115): tests only, plus doc-comment corrections,

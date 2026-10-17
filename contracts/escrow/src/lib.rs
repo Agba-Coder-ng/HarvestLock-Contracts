@@ -316,6 +316,11 @@ pub struct OracleConfig {
     /// of the multiplication is what lets `resolve_fx_shortfall`'s
     /// conversion formula skip a separate unit-normalization step — see
     /// its doc comment for the worked example.
+    ///
+    /// **Not** the oracle's `decimals()` — that is a property of the
+    /// oracle, read live at settlement and assumed immutable (see
+    /// `docs/reflector-decimals-assumption.md`, issue #63); this field is
+    /// the deal's value in the same 7-decimal units as `total_amount`.
     pub denominated_amount: i128,
 }
 
@@ -1209,6 +1214,17 @@ impl EscrowContract {
     /// assuming a slightly better rate, escrow might hold only
     /// 6_500_000_000 (650 USDC) — a genuine 17 USDC shortfall the buyer
     /// now owes, exactly the FX-risk gap PRD §4.2 names.
+    ///
+    /// **The `decimals` divisor is trusted to be constant** (#63): it is read
+    /// live from the oracle rather than pinned in `OracleConfig`, because it
+    /// is a property of the oracle, not the commitment. Reflector's real
+    /// contract makes `decimals` immutable (write-once at `config`, no
+    /// setter; SEP-40 likewise says it "should never change"), so the trust
+    /// is well-placed for the deployed oracle. If it were ever violated the
+    /// conversion would silently rescale by a power of ten rather than
+    /// error — see `docs/reflector-decimals-assumption.md` and the
+    /// `a_plausible_decimals_change_silently_rescales_resolve_fx_shortfall`
+    /// test that pins it.
     ///
     /// Requires both tranches already resolved (same guard `settle`
     /// itself has) before reading `claimed_by_coop` — computing this

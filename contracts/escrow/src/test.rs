@@ -180,7 +180,7 @@ fn set_time(s: &Setup, timestamp: u64) {
 /// mirrors `EscrowContract::deposit_amount` so tests can assert against it
 /// without reaching into contract internals.
 fn deposit_amount(total: i128, advance1_bps: u32, advance2_bps: u32) -> i128 {
-    total * ((advance1_bps + advance2_bps) as i128) / 10_000
+    total * i128::from(advance1_bps + advance2_bps) / 10_000
 }
 
 /// Drives a fresh, locked commitment all the way to `ReadyForDelivery` with
@@ -515,7 +515,7 @@ fn cannot_set_allocation_with_more_than_max_members() {
     // length itself has to be rejected.
     let s = setup(1_500, 1_500);
     let mut members = Vec::new(&s.env);
-    for _ in 0..(MAX_ALLOCATION_MEMBERS + 1) {
+    for _ in 0..=MAX_ALLOCATION_MEMBERS {
         members.push_back(member(&s.env, 1));
     }
     let result = s.contract.try_set_allocation(&members);
@@ -2071,7 +2071,7 @@ fn initialize_rejects_a_grade_schedule_over_max_entries() {
     let contract = EscrowContractClient::new(&env, &contract_id);
 
     let mut over_cap = Vec::new(&env);
-    for _ in 0..(MAX_GRADE_ENTRIES + 1) {
+    for _ in 0..=MAX_GRADE_ENTRIES {
         over_cap.push_back(10_000u32);
     }
 
@@ -2188,7 +2188,7 @@ fn confirm_delivery_storage_profile_and_settlement_bps_invariants() {
     assert_eq!(post.total_amount, pre.total_amount);
     assert_eq!(post.advance1_claimed, pre.advance1_claimed);
     assert_eq!(post.advance2_claimed, pre.advance2_claimed);
-    assert_eq!(post.remainder_funded, true);
+    assert!(post.remainder_funded);
 }
 
 #[test]
@@ -3291,22 +3291,22 @@ fn commitment_struct_footprint_and_field_invariants() {
         s.env.ledger().timestamp() + DELIVERY_WINDOW
     );
     assert_eq!(c.advance1_deadline, 0);
-    assert_eq!(c.advance1_claimed, false);
-    assert_eq!(c.advance1_expired, false);
+    assert!(!c.advance1_claimed);
+    assert!(!c.advance1_expired);
     assert_eq!(c.advance2_deadline, 0);
-    assert_eq!(c.advance2_claimed, false);
-    assert_eq!(c.advance2_expired, false);
+    assert!(!c.advance2_claimed);
+    assert!(!c.advance2_expired);
     assert_eq!(c.remainder_deadline, 0);
-    assert_eq!(c.remainder_funded, false);
+    assert!(!c.remainder_funded);
     assert_eq!(c.contracted_quantity, CONTRACTED_QUANTITY);
     assert_eq!(c.grade_price_bps.len(), 3);
     assert_eq!(c.delivered_quantity, 0);
     assert_eq!(c.grade_index, 0);
     assert_eq!(c.settlement_bps, 0);
-    assert_eq!(c.fx_resolved, false);
+    assert!(!c.fx_resolved);
     assert_eq!(c.fx_adjusted_total, 0);
     assert_eq!(c.fx_shortfall_amount, 0);
-    assert_eq!(c.fx_shortfall_funded, false);
+    assert!(!c.fx_shortfall_funded);
     assert_eq!(c.fx_shortfall_deadline, 0);
     assert_eq!(c.dispute_pre_status, Status::Draft);
     assert_eq!(c.dispute_deadline, 0);
@@ -3502,13 +3502,14 @@ fn assert_transition(s: &Setup, from: Status, to: Status) {
 /// `status_changed` — a call moved funds, set a clock, or created the
 /// commitment without being a state transition.
 fn assert_no_transition(s: &Setup) {
-    assert!(s
-        .env
-        .events()
-        .all()
-        .filter_by_contract(&s.contract.address)
-        .events()
-        .is_empty());
+    assert_eq!(
+        s.env
+            .events()
+            .all()
+            .filter_by_contract(&s.contract.address)
+            .events(),
+        []
+    );
 }
 
 #[test]
@@ -3868,7 +3869,8 @@ fn resolve_fx_shortfall_rejects_while_the_first_tranche_is_still_open() {
     s.contract.claim_advance_2();
     s.contract.ready_for_delivery();
     s.contract.fund_remainder();
-    s.contract.confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
+    s.contract
+        .confirm_delivery(&CONTRACTED_QUANTITY, &FULL_PRICE_GRADE);
 
     let c = s.contract.get_commitment();
     assert!(!c.advance1_claimed && !c.advance1_expired);

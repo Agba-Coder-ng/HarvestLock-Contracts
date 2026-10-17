@@ -8,8 +8,8 @@ on:
 # Explicit least-privilege token, not relying on the repo/org default
 # (currently "read" too, checked directly -- but shouldn't depend on
 # that staying true). No job pushes, comments, or writes anything --
-# checkout, the static guard scripts, cargo test, and stellar contract
-# build all only need read access.
+# checkout, the static guard scripts, cargo test, Clippy, and the stellar
+# contract build all only need read access.
 permissions:
   contents: read
 
@@ -43,6 +43,31 @@ jobs:
       - name: cargo test
         working-directory: contracts/escrow
         run: cargo test --locked --verbose
+
+  clippy:
+    name: Clippy pedantic and nursery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Keep these advisory until the existing baseline is deliberately
+      # reduced; see docs/clippy-triage.md for the one-time triage.
+      - name: Check Clippy pedantic and nursery lints
+        run: cargo clippy --workspace --all-targets --locked -- -W clippy::pedantic -W clippy::nursery
 
   # ---------------------------------------------------------------------
   # #111, #122, #124, #125 — four integration suites, each its own job so

@@ -172,12 +172,7 @@ fn oracle_world(max_age_secs: u64, denominated_amount: i128) -> OracleWorld {
     let oracle_id = env.register(faulty_oracle::FaultyOracle, ());
     let oracle = faulty_oracle::FaultyOracleClient::new(&env, &oracle_id);
     oracle.set_quote(&FRESH_PRICE, &env.ledger().timestamp());
-    let w = build_with(
-        env.clone(),
-        oracle_id.clone(),
-        max_age_secs,
-        denominated_amount,
-    );
+    let w = build_with(env, oracle_id.clone(), max_age_secs, denominated_amount);
     OracleWorld {
         w,
         oracle_addr: oracle_id,
@@ -191,12 +186,7 @@ fn oracle_world_unreachable(max_age_secs: u64, denominated_amount: i128) -> Orac
     env.mock_all_auths();
     // Generated, funded-looking, and deliberately *never registered*.
     let dangling = Address::generate(&env);
-    let w = build_with(
-        env.clone(),
-        dangling.clone(),
-        max_age_secs,
-        denominated_amount,
-    );
+    let w = build_with(env, dangling.clone(), max_age_secs, denominated_amount);
     OracleWorld {
         w,
         oracle_addr: dangling,

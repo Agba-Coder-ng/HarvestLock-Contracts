@@ -823,7 +823,28 @@ if it doesn't, trust the code and the test output over this file, and fix
 this file to match before doing anything else.
 
 ---
-*Last updated: 16 Oct 2026 (night) — exact-deadline boundary coverage for all
+*Last updated: 17 Oct 2026 — #62, the mutation-testing spike
+(cargo-mutants): one full run against `0f201c3` — 219 mutants in 41 min on
+2 vCPU: 197 caught, 14 survived, 8 unviable (93.4% of the runnable mutants
+killed), recorded in full in [`docs/mutation-testing.md`](./docs/mutation-testing.md).
+Three of the fourteen survivors were real gaps, and both gaps were *masked*
+rather than missing: `initialize`'s `advance1_bps + advance2_bps > 10_000`
+guard only ever had the reject side tested (nothing initializes with a sum of
+exactly 10_000, so `>=` would have silently rejected a legal 100%-advance
+deal), and `resolve_fx_shortfall`'s two identical tranche guards answered for
+each other because the sole negative test leaves *both* tranches open. Two new
+tests kill all three mutants, each verified by applying the mutant and
+watching the new test fail rather than by trusting a green suite. The other
+eleven survivors are equivalent mutants: ten `amount > 0` guards around token
+transfers (a zero-amount transfer moves no balance any client can read), and
+`settle`'s FX guard, whose `amount == 0 && !funded` pair is unreachable by
+`resolve_fx_shortfall`'s own construction — which its comment already says. CI
+now runs `cargo mutants --in-diff` over the Rust lines a PR changes
+(`test.yml`), deliberately *not* the full run (41 min here) and deliberately
+not added to `REQUIRED_CHECKS`, which is maintainer-managed; `mutants.out/`
+is gitignored. No contract code changed.
+
+Prior entry: 16 Oct 2026 (night) — exact-deadline boundary coverage for all
 four absolute deadlines (#112–#115): tests only, plus doc-comment corrections,
 no contract behavior changed. Each of `remainder_deadline`,
 `delivery_deadline`, `fx_shortfall_deadline` and `dispute_deadline` now has a

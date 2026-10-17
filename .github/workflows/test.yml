@@ -44,6 +44,32 @@ jobs:
         working-directory: contracts/escrow
         run: cargo test --locked --verbose
 
+  coverage:
+    name: code coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Report line coverage
+        run: cargo llvm-cov --workspace --all-targets --locked
+
   # ---------------------------------------------------------------------
   # #111, #122, #124, #125 — four integration suites, each its own job so
   # a failure points at the issue it guards instead of at "cargo test".

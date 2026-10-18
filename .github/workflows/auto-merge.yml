@@ -90,6 +90,8 @@ jobs:
         Conventional Commits
         cargo test
         stellar contract build
+        Verify WASM build reproducibility
+        cargo deny
       # Top-level path prefixes PRs normally touch. Files outside these
       # are listed in the informational diff note (they do not block
       # the merge — only green CI and CodeRabbit do).

@@ -71,12 +71,40 @@ jobs:
         run: cargo llvm-cov --workspace --all-targets --locked
 
   # ---------------------------------------------------------------------
-  # #111, #122, #124, #125 — four integration suites, each its own job so
-  # a failure points at the issue it guards instead of at "cargo test".
+  # #2, #111, #122, #124, #125 — five integration suites, each its own job
+  # so a failure points at the issue it guards instead of at "cargo test".
   # They are separate `--test` targets under contracts/escrow/tests/, so
   # the umbrella `test` job above also runs them; these jobs exist so the
   # signal is legible per issue and so a suite can be re-run alone.
   # ---------------------------------------------------------------------
+
+  permissionless-release-review:
+    name: "#2 permissionless release review"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Pins docs/permissionless-release-review.md's conclusions: the two
+      # tranche-opening calls need no signature, move no funds, write their
+      # clock exactly once, and empower nobody — including the issue's
+      # end-to-end third-party griefing scenario.
+      - name: cargo test --test permissionless_release_review
+        working-directory: contracts/escrow
+        run: cargo test --test permissionless_release_review --verbose
 
   deadline-boundary:
     name: "#111 deadline boundary tests"
@@ -226,6 +254,23 @@ jobs:
         working-directory: .
         run: stellar contract build --locked
 
+      - name: Verify WASM build reproducibility
+        working-directory: .
+        run: |
+          # Build once more from a clean target directory and compare hashes.
+          # If the two builds produce different WASM, this step fails.
+          HASH_1=$(sha256sum target/wasm32v1-none/release/harvestlock_escrow.wasm | awk '{print $1}')
+          rm -rf target
+          stellar contract build --locked
+          HASH_2=$(sha256sum target/wasm32v1-none/release/harvestlock_escrow.wasm | awk '{print $1}')
+          echo "Build 1 hash: $HASH_1"
+          echo "Build 2 hash: $HASH_2"
+          if [ "$HASH_1" != "$HASH_2" ]; then
+            echo "::error::WASM build is NOT reproducible — hashes differ between runs"
+            exit 1
+          fi
+          echo "WASM build is reproducible (hash=$HASH_1)"
+
   # Regression safety nets one layer up from `cargo test`: both guard a
   # class of problem no single hand-written test is positioned to catch
   # once the offending PR is already merged.
@@ -358,3 +403,29 @@ jobs:
         run: |
           cd contracts/escrow
           git checkout Cargo.toml
+
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+
+      - name: Check advisories and bans
+        run: cargo deny check advisories bans
